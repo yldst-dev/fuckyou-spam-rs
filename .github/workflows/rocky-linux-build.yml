@@ -22,10 +22,11 @@ jobs:
           - runner: ubuntu-24.04
             arch_label: x86_64
             arch: x86_64
-          # Temporarily disabled - requires self-hosted ARM64 runner
-          # - runner: ubuntu-24.04-arm64
-          #   arch_label: aarch64
-          #   arch: aarch64
+            rust_target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04
+            arch_label: aarch64
+            arch: aarch64
+            rust_target: aarch64-unknown-linux-gnu
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -69,6 +70,17 @@ jobs:
             sqlite-devel \
             zlib-devel
 
+          # Install cross-compilation tools for ARM64
+          if [[ "${{ matrix.arch }}" == "aarch64" ]]; then
+            dnf -y install \
+              gcc-aarch64-linux-gnu \
+              g++-aarch64-linux-gnu \
+              gcc-aarch64-linux-gnu \
+              glibc-devel.aarch64 \
+              openssl-devel.aarch64 \
+              sqlite-devel.aarch64
+          fi
+
           # Install dnf plugins if needed
           dnf -y install dnf-plugins-core || true
 
@@ -89,6 +101,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          targets: ${{ matrix.rust_target }}
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -114,17 +127,32 @@ jobs:
           export PKG_CONFIG_ALLOW_SYSTEM_LIBS=1
           echo "PKG_CONFIG_ALLOW_SYSTEM_LIBS=1" >> $GITHUB_ENV
 
+          # Configure cross-compilation for ARM64
+          if [[ "${{ matrix.arch }}" == "aarch64" ]]; then
+            export CC=aarch64-linux-gnu-gcc
+            export CXX=aarch64-linux-gnu-g++
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            echo "CC=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+            echo "CXX=aarch64-linux-gnu-g++" >> $GITHUB_ENV
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+            # Add pkgconfig paths for ARM64
+            export PKG_CONFIG_PATH=/usr/lib64/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig:/usr/lib64/pkgconfig
+            echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> $GITHUB_ENV
+          fi
+
           # Display architecture info
           echo "Building for: $(uname -m)"
-          echo "Rust target: ${{ matrix.arch == 'aarch64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }}"
+          echo "Target arch: ${{ matrix.arch }}"
+          echo "Rust target: ${{ matrix.rust_target }}"
 
       - name: Release build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target ${{ matrix.rust_target }}
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: fuckyou-spam-${{ matrix.arch_label }}
-          path: target/release/fuckyou-spam-rust
+          path: target/${{ matrix.rust_target }}/release/fuckyou-spam-rust
           retention-days: 30
           if-no-files-found: error
