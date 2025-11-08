@@ -22,9 +22,10 @@ jobs:
           - runner: ubuntu-24.04
             arch_label: x86_64
             arch: x86_64
-          - runner: ubuntu-24.04-arm64
-            arch_label: aarch64
-            arch: aarch64
+          # Temporarily disabled - requires self-hosted ARM64 runner
+          # - runner: ubuntu-24.04-arm64
+          #   arch_label: aarch64
+          #   arch: aarch64
     env:
       CARGO_TERM_COLOR: always
     steps:
