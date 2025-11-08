@@ -15,17 +15,14 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container:
       image: rockylinux:9
-      options: --platform ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: ubuntu-24.04
             arch_label: x86_64
-            platform: linux/amd64
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-24.04-arm64
             arch_label: aarch64
-            platform: linux/arm64
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -38,13 +35,16 @@ jobs:
           dnf -y install dnf-plugins-core
           dnf config-manager --set-enabled crb
           dnf -y install \
+            ca-certificates \
             curl \
             gcc \
+            gcc-c++ \
             git \
             make \
-            pkgconfig \
+            pkgconf-pkg-config \
             openssl-devel \
             sqlite \
+            sqlite-libs \
             sqlite-devel \
             tar \
             xz
