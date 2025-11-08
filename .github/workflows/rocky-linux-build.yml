@@ -43,6 +43,7 @@ jobs:
             git \
             make \
             pkgconfig \
+            openssl-devel \
             sqlite \
             sqlite-devel \
             tar \
