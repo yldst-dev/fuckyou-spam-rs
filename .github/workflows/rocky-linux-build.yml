@@ -49,23 +49,23 @@ jobs:
 
           # Install build tools and dependencies step by step to avoid conflicts
           # Install base development tools
-          dnf -y install \\
-            ca-certificates \\
-            curl \\
-            git \\
-            gcc \\
-            gcc-c++ \\
-            make \\
-            pkgconf-pkg-config \\
-            tar \\
-            xz \\
+          dnf -y install \
+            ca-certificates \
+            curl \
+            git \
+            gcc \
+            gcc-c++ \
+            make \
+            pkgconf-pkg-config \
+            tar \
+            xz \
             which
 
           # Install development libraries
-          dnf -y install \\
-            openssl-devel \\
-            sqlite \\
-            sqlite-devel \\
+          dnf -y install \
+            openssl-devel \
+            sqlite \
+            sqlite-devel \
             zlib-devel
 
           # Install dnf plugins if needed
