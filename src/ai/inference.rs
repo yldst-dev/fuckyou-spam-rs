@@ -30,7 +30,7 @@ pub fn build_request(model: String, prompt: &str) -> ChatCompletionRequest {
         ],
         temperature: 0.2,
         top_p: 1.0,
-        max_output_tokens: 1024,
+        max_tokens: 1024,  // Changed from max_output_tokens to max_tokens
         response_format: ResponseFormat {
             r#type: "json_object".into(),
         },
@@ -60,7 +60,7 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     pub temperature: f32,
     pub top_p: f32,
-    pub max_output_tokens: i32,
+    pub max_tokens: i32,  // Changed from max_output_tokens
     pub response_format: ResponseFormat,
 }
 
