@@ -38,31 +38,31 @@ jobs:
           arch || true
 
           # Ensure dnf plugins are available before using config-manager
-          dnf -y install dnf-plugins-core || true
+          dnf -y install dnf-plugins-core --allowerasing || true
           # Fallback: install specific plugin if config-manager is missing
-          dnf -y install 'dnf-command(config-manager)' || true
+          dnf -y install 'dnf-command(config-manager)' --allowerasing || true
 
           # Refresh metadata and enable CRB
           dnf -y --refresh makecache
           dnf config-manager --set-enabled crb || true
 
           # Optional: developer toolchain group for robust builds
-          dnf -y groupinstall "Development Tools" || true
+          dnf -y groupinstall "Development Tools" --allowerasing || true
 
-          # Core dependencies for Rust + sqlx(sqlite)
-          dnf -y install \
-            ca-certificates \
-            curl \
-            git \
-            gcc \
-            gcc-c++ \
-            make \
-            pkgconf-pkg-config \
-            openssl-devel \
-            sqlite \
-            sqlite-devel \
-            zlib-devel \
-            tar \
+          # Core dependencies for Rust + sqlx(sqlite) - with --allowerasing to resolve package conflicts
+          dnf -y install --allowerasing \\
+            ca-certificates \\
+            curl \\
+            git \\
+            gcc \\
+            gcc-c++ \\
+            make \\
+            pkgconf-pkg-config \\
+            openssl-devel \\
+            sqlite \\
+            sqlite-devel \\
+            zlib-devel \\
+            tar \\
             xz
 
           # Diagnostics: verify toolchain and pkg-config entries
