@@ -1,0 +1,53 @@
+name: Rocky Linux Build
+
+on:
+  push:
+    branches:
+      - port-rs
+  pull_request:
+    branches:
+      - port-rs
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Rocky Linux (${{ matrix.arch_label }})
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: rockylinux:9
+      options: --platform ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch_label: x86_64
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            arch_label: aarch64
+            platform: linux/arm64
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          dnf -y update
+          dnf -y install \
+            curl \
+            gcc \
+            git \
+            make \
+            pkgconfig \
+            sqlite \
+            sqlite-devel \
+            tar \
+            xz
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Release build
+        run: cargo build --release --locked
