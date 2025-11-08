@@ -37,20 +37,17 @@ jobs:
           uname -a || true
           arch || true
 
-          # Ensure dnf plugins are available before using config-manager
-          dnf -y install dnf-plugins-core --allowerasing || true
-          # Fallback: install specific plugin if config-manager is missing
-          dnf -y install 'dnf-command(config-manager)' --allowerasing || true
+          # Update system packages first
+          dnf -y update --minimal
 
-          # Refresh metadata and enable CRB
-          dnf -y --refresh makecache
-          dnf config-manager --set-enabled crb || true
+          # Enable CRB repository first
+          dnf -y install epel-release
+          dnf config-manager --set-enabled crb || dnf config-manager --set-enabled powertools || true
+          dnf -y makecache
 
-          # Optional: developer toolchain group for robust builds
-          dnf -y groupinstall "Development Tools" --allowerasing || true
-
-          # Core dependencies for Rust + sqlx(sqlite) - with --allowerasing to resolve package conflicts
-          dnf -y install --allowerasing \\
+          # Install build tools and dependencies step by step to avoid conflicts
+          # Install base development tools
+          dnf -y install \\
             ca-certificates \\
             curl \\
             git \\
@@ -58,22 +55,49 @@ jobs:
             gcc-c++ \\
             make \\
             pkgconf-pkg-config \\
+            tar \\
+            xz \\
+            which
+
+          # Install development libraries
+          dnf -y install \\
             openssl-devel \\
             sqlite \\
             sqlite-devel \\
-            zlib-devel \\
-            tar \\
-            xz
+            zlib-devel
+
+          # Install dnf plugins if needed
+          dnf -y install dnf-plugins-core || true
 
           # Diagnostics: verify toolchain and pkg-config entries
           pkgconf --version || true
           sqlite3 --version || true
           echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-}" || true
-          export PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig
-          pkg-config --list-all | grep -E '^sqlite3$' || true
+          export PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig:/usr/lib/pkgconfig
+          pkg-config --list-all | grep -E 'sqlite3' || true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Verify Cargo.lock
+        run: |
+          if [ ! -f Cargo.lock ]; then
+            echo "Cargo.lock not found, generating..."
+            cargo generate-lockfile
+          fi
 
       - name: Release build
         run: cargo build --release --locked
