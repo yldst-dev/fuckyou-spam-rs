@@ -31,23 +31,46 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          dnf -y update
-          dnf -y install dnf-plugins-core
-          dnf config-manager --set-enabled crb
+          set -euxo pipefail
+          echo "=== OS Info ==="
+          cat /etc/os-release || true
+          uname -a || true
+          arch || true
+
+          # Ensure dnf plugins are available before using config-manager
+          dnf -y install dnf-plugins-core || true
+          # Fallback: install specific plugin if config-manager is missing
+          dnf -y install 'dnf-command(config-manager)' || true
+
+          # Refresh metadata and enable CRB
+          dnf -y --refresh makecache
+          dnf config-manager --set-enabled crb || true
+
+          # Optional: developer toolchain group for robust builds
+          dnf -y groupinstall "Development Tools" || true
+
+          # Core dependencies for Rust + sqlx(sqlite)
           dnf -y install \
             ca-certificates \
             curl \
+            git \
             gcc \
             gcc-c++ \
-            git \
             make \
             pkgconf-pkg-config \
             openssl-devel \
             sqlite \
-            sqlite-libs \
             sqlite-devel \
+            zlib-devel \
             tar \
             xz
+
+          # Diagnostics: verify toolchain and pkg-config entries
+          pkgconf --version || true
+          sqlite3 --version || true
+          echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-}" || true
+          export PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/share/pkgconfig
+          pkg-config --list-all | grep -E '^sqlite3$' || true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
