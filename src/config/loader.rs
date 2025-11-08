@@ -53,7 +53,7 @@ impl AppConfig {
                         .filter(|part| !part.is_empty())
                         .collect::<Vec<_>>()
                 })
-                .unwrap_or_else(|_| vec!["0 0 * * *".to_string(), "0 12 * * *".to_string()]),
+                .unwrap_or_else(|_| vec!["0 0 0 * * *".to_string(), "0 0 12 * * *".to_string()]),
         };
 
         let web = WebContentConfig {
