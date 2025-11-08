@@ -35,6 +35,8 @@ jobs:
       - name: Install system dependencies
         run: |
           dnf -y update
+          dnf -y install dnf-plugins-core
+          dnf config-manager --set-enabled crb
           dnf -y install \
             curl \
             gcc \
