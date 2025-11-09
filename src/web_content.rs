@@ -35,8 +35,10 @@ impl WebContentFetcher {
         }
 
         let body = response.text().await?;
-        let mut smoothie_cfg = ReadabilityConfig::default();
-        smoothie_cfg.text_mode = TextMode::Formatted;
+        let smoothie_cfg = ReadabilityConfig {
+            text_mode: TextMode::Formatted,
+            ..Default::default()
+        };
 
         let mut readability =
             match Readability::new(body.as_str(), Some(url.as_str()), Some(smoothie_cfg)) {

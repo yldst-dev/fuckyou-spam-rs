@@ -38,11 +38,11 @@ impl AppState {
     }
 
     pub fn is_admin_group(&self, chat_id: i64) -> bool {
-        self.config.admin_group_id.map_or(false, |id| id == chat_id)
+        self.config.admin_group_id == Some(chat_id)
     }
 
     pub fn is_admin_user(&self, user_id: i64) -> bool {
-        self.config.admin_user_id.map_or(false, |id| id == user_id)
+        self.config.admin_user_id == Some(user_id)
     }
 }
 

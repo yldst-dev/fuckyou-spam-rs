@@ -127,11 +127,11 @@ impl TelegramService {
 
         let from = msg.from.as_ref();
         let from_display = from
-            .map(|user| format_user_display(user))
+            .map(format_user_display)
             .unwrap_or_else(|| "Unknown".to_string());
         let username = from.and_then(|u| u.username.clone());
         let raw_user_id = from.map(|u| u.id);
-        let from_id = from.map(|u| user_to_i64(u));
+        let from_id = from.map(user_to_i64);
 
         let is_group_member = if let Some(user_id) = raw_user_id {
             is_group_member(&bot, msg.chat.id, user_id).await
@@ -238,7 +238,7 @@ impl TelegramService {
             return Ok(true);
         }
 
-        let mut parts = text.trim().split_whitespace();
+        let mut parts = text.split_whitespace();
         let command = parts.next().unwrap_or("");
         match command {
             "/whitelist_add" => {

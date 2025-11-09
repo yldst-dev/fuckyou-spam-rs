@@ -168,7 +168,7 @@ impl SpamGuardApp {
             }
         }
 
-        if let Err(_) = timeout(shutdown_timeout, whitelist.close()).await {
+        if timeout(shutdown_timeout, whitelist.close()).await.is_err() {
             tracing::warn!(
                 target: "db",
                 "화이트리스트 리소스 정리가 {:?} 내에 완료되지 않았습니다.",
