@@ -1,0 +1,43 @@
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# GitHub
+.github/
+
+# Documentation
+README.md
+docs/
+
+# Logs
+logs/
+*.log
+
+# Data
+data/
+*.db
+*.sqlite
+
+# CI/CD
+.gitlab-ci.yml
+.travis.yml

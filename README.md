@@ -27,13 +27,23 @@ A high-performance Telegram spam detection bot written in Rust, powered by AI to
 
 ## 🛠️ Installation
 
-### 1. Clone the Repository
+### Option 1: Download Pre-built Binary
+
+You can download pre-built binaries from the [Releases](https://github.com/yldst-dev/fuckyou-spam-rs/releases) page. The following platforms are supported:
+
+- **Linux**: x86_64 (GNU and MUSL), ARM64 (AArch64)
+- **macOS**: x86_64 (Intel), Apple Silicon (M1/M2)
+- **Windows**: x86_64
+
+### Option 2: Build from Source
+
+#### 1. Clone the Repository
 ```bash
 git clone https://github.com/yldst-dev/fuckyou-spam-rs.git
 cd fuckyou-spam-rs
 ```
 
-### 2. Install Dependencies
+#### 2. Install Dependencies
 ```bash
 cargo build --release
 ```
@@ -59,8 +69,19 @@ TIMEZONE=Asia/Seoul
 ```
 
 ### 4. Run the Bot
+
+#### Using Cargo
 ```bash
 cargo run --release
+```
+
+#### Using Binary
+```bash
+# Linux/macOS
+./fuckyou-spam-rust
+
+# Windows
+./fuckyou-spam-rust.exe
 ```
 
 ## 📖 Usage
@@ -226,28 +247,53 @@ sudo systemctl start fuckyou-spam
 
 ### Docker Deployment
 
-Create a `Dockerfile`:
+A `Dockerfile` is included in the repository for containerized deployment.
 
-```dockerfile
-FROM rust:1.70 as builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release
-
-FROM debian:bullseye-slim
-RUN apt-get update && apt-get install -y sqlite3 ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/fuckyou-spam-rust /usr/local/bin/
-RUN useradd -r -s /bin/false botuser
-USER botuser
-EXPOSE 3000
-CMD ["fuckyou-spam-rust"]
+#### Using Pre-built Docker Image
+```bash
+docker run -d --name spam-bot \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/logs:/app/logs \
+  --env-file .env \
+  yldstdev/fuckyou-spam-rust:latest
 ```
 
-Build and run:
+#### Build from Source
 ```bash
 docker build -t fuckyou-spam-rust .
-docker run -d --name spam-bot -v $(pwd)/data:/app/data -v $(pwd)/logs:/app/logs --env-file .env fuckyou-spam-rust
+docker run -d --name spam-bot \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/logs:/app/logs \
+  --env-file .env \
+  fuckyou-spam-rust
 ```
+
+### GitHub Actions
+
+The project includes comprehensive CI/CD pipelines:
+
+#### CI Pipeline (`.github/workflows/ci.yml`)
+- **Multi-version Testing**: Tests against stable, beta, and nightly Rust
+- **Code Quality**: Rustfmt formatting check and Clippy linting
+- **Security Audit**: Automated security vulnerability scanning
+- **Code Coverage**: Integration with Codecov for coverage reporting
+- **Caching**: Optimized build caching for faster CI
+
+#### Release Pipeline (`.github/workflows/release.yml`)
+- **Cross-platform Builds**: Supports Linux (x86_64, ARM64), macOS (Intel, Apple Silicon), and Windows
+- **Binary Releases**: Automatic GitHub releases with pre-built binaries
+- **Docker Images**: Multi-architecture Docker images (AMD64, ARM64)
+- **Artifact Management**: Proper binary stripping and compression
+
+#### Release Process
+To create a new release:
+1. Tag your commit with a version number: `git tag v1.0.0`
+2. Push the tag: `git push origin v1.0.0`
+3. GitHub Actions will automatically:
+   - Build binaries for all platforms
+   - Create a GitHub release
+   - Build and push Docker images
+   - Attach binaries to the release
 
 ## 🤝 Contributing
 
