@@ -7,6 +7,7 @@ use teloxide::{
     types::{BotCommandScope, ChatId, Message, Recipient},
     utils::command::BotCommands,
 };
+use tokio::time::Instant;
 
 use crate::{
     config::AppConfig,
@@ -17,7 +18,7 @@ use crate::{
 };
 
 use super::{
-    types::{AppState, BotResult, GeneralCommand, QueueSnapshotProvider, is_group_member},
+    types::{is_group_member, AppState, BotResult, GeneralCommand, QueueSnapshotProvider},
     utils::{admin_command_list, calc_priority, extract_urls, format_user_display, user_to_i64},
 };
 
@@ -170,11 +171,11 @@ impl TelegramService {
                 bot.send_message(
                     msg.chat.id,
                     format!(
-                        "👋 안녕하세요! 스팸 감지 봇입니다.\n현재 그룹 상태: {}",
+                        "안녕하세요! 스팸 감지 봇입니다.\n현재 그룹 상태: {}",
                         if allowed {
-                            "✅ 활성화"
+                            "활성화됨"
                         } else {
-                            "❌ 비활성화"
+                            "비활성화됨"
                         }
                     ),
                 )
@@ -189,23 +190,25 @@ impl TelegramService {
                 bot.send_message(
                     msg.chat.id,
                     format!(
-                        "📊 봇 상태\n- 높은 우선순위: {}\n- 일반 우선순위: {}",
+                        "봇 상태\n- 높은 우선순위: {}\n- 일반 우선순위: {}",
                         snapshot.high_priority, snapshot.normal_priority
                     ),
                 )
                 .await?
             }
             GeneralCommand::Chatid => {
-                bot.send_message(msg.chat.id, format!("🆔 현재 채팅 ID: {}", msg.chat.id))
+                bot.send_message(msg.chat.id, format!("현재 채팅 ID: {}", msg.chat.id))
                     .await?
             }
             GeneralCommand::Ping => {
-                let sent = bot.send_message(msg.chat.id, "🏓 Pong 측정 중...").await?;
-                let latency = (sent.date - msg.date).num_seconds().max(0);
+                let start = Instant::now();
+                let sent = bot.send_message(msg.chat.id, "Pong 측정 중...").await?;
+                let elapsed = start.elapsed();
+                let latency_secs = elapsed.as_secs_f64();
                 bot.edit_message_text(
                     msg.chat.id,
                     sent.id,
-                    format!("🏓 Pong! 응답 속도: {}초", latency),
+                    format!("Pong! 응답 속도: {:.3}초", latency_secs),
                 )
                 .await?
             }
@@ -230,7 +233,7 @@ impl TelegramService {
             None => return Ok(false),
         };
         if !state.is_admin_user(user_to_i64(from)) {
-            bot.send_message(msg.chat.id, "❌ 이 명령어는 관리자만 사용할 수 있습니다.")
+            bot.send_message(msg.chat.id, "이 명령어는 관리자만 사용할 수 있습니다.")
                 .await?;
             return Ok(true);
         }
@@ -247,7 +250,7 @@ impl TelegramService {
                         Err(_) => {
                             bot.send_message(
                                 msg.chat.id,
-                                "❌ 올바른 그룹 ID를 입력하세요. 예: /whitelist_add -1001234567890",
+                                "올바른 그룹 ID를 입력하세요. 예: /whitelist_add -1001234567890",
                             )
                             .await?;
                         }
@@ -255,7 +258,7 @@ impl TelegramService {
                 } else {
                     bot.send_message(
                         msg.chat.id,
-                        "❌ 그룹 ID가 필요합니다. 예: /whitelist_add -1001234567890",
+                        "그룹 ID가 필요합니다. 예: /whitelist_add -1001234567890",
                     )
                     .await?;
                 }
@@ -270,7 +273,7 @@ impl TelegramService {
                         Err(_) => {
                             bot.send_message(
                                 msg.chat.id,
-                                "❌ 올바른 그룹 ID를 입력하세요. 예: /whitelist_remove -1001234567890",
+                                "올바른 그룹 ID를 입력하세요. 예: /whitelist_remove -1001234567890",
                             )
                             .await?;
                         }
@@ -278,7 +281,7 @@ impl TelegramService {
                 } else {
                     bot.send_message(
                         msg.chat.id,
-                        "❌ 그룹 ID가 필요합니다. 예: /whitelist_remove -1001234567890",
+                        "그룹 ID가 필요합니다. 예: /whitelist_remove -1001234567890",
                     )
                     .await?;
                 }
@@ -290,7 +293,7 @@ impl TelegramService {
             }
             "/sync_commands" => {
                 Self::sync_commands_for(bot, &state.config).await?;
-                bot.send_message(msg.chat.id, "✅ 봇 명령어 동기화 완료")
+                bot.send_message(msg.chat.id, "봇 명령어 동기화를 완료했습니다.")
                     .await?;
                 Ok(true)
             }
@@ -316,30 +319,25 @@ impl TelegramService {
                     Ok(true) => {
                         bot.send_message(
                             msg.chat.id,
-                            format!(
-                                "✅ 그룹 (ID: {target_chat_id})이 화이트리스트에 추가되었습니다."
-                            ),
+                            format!("그룹 (ID: {target_chat_id})이 화이트리스트에 추가되었습니다."),
                         )
                         .await?;
                     }
                     Ok(false) => {
-                        bot.send_message(msg.chat.id, "⚠️ 이미 등록된 그룹입니다.")
+                        bot.send_message(msg.chat.id, "이미 등록된 그룹입니다.")
                             .await?;
                     }
                     Err(err) => {
                         tracing::error!(target: "admin", error = %err, "failed to add whitelist");
-                        bot.send_message(
-                            msg.chat.id,
-                            "❌ 화이트리스트 추가 중 오류가 발생했습니다.",
-                        )
-                        .await?;
+                        bot.send_message(msg.chat.id, "화이트리스트 추가 중 오류가 발생했습니다.")
+                            .await?;
                     }
                 }
             }
             Err(_) => {
                 bot.send_message(
                     msg.chat.id,
-                    "❌ 해당 그룹을 찾을 수 없습니다. 봇이 그룹에 추가되어 있는지 확인하세요.",
+                    "해당 그룹을 찾을 수 없습니다. 봇이 그룹에 추가되어 있는지 확인하세요.",
                 )
                 .await?;
             }
@@ -357,17 +355,17 @@ impl TelegramService {
             Ok(true) => {
                 bot.send_message(
                     msg.chat.id,
-                    format!("✅ 그룹 (ID: {target_chat_id})이 화이트리스트에서 제거되었습니다."),
+                    format!("그룹 (ID: {target_chat_id})이 화이트리스트에서 제거되었습니다."),
                 )
                 .await?;
             }
             Ok(false) => {
-                bot.send_message(msg.chat.id, "⚠️ 화이트리스트에 등록되지 않은 그룹입니다.")
+                bot.send_message(msg.chat.id, "화이트리스트에 등록되지 않은 그룹입니다.")
                     .await?;
             }
             Err(err) => {
                 tracing::error!(target: "admin", error = %err, "failed to remove whitelist");
-                bot.send_message(msg.chat.id, "❌ 화이트리스트 제거 중 오류가 발생했습니다.")
+                bot.send_message(msg.chat.id, "화이트리스트 제거 중 오류가 발생했습니다.")
                     .await?;
             }
         }
@@ -378,11 +376,11 @@ impl TelegramService {
         match state.whitelist.list().await {
             Ok(rows) => {
                 if rows.is_empty() {
-                    bot.send_message(msg.chat.id, "📋 화이트리스트가 비어있습니다.")
+                    bot.send_message(msg.chat.id, "화이트리스트가 비어있습니다.")
                         .await?;
                     return Ok(());
                 }
-                let mut message = String::from("📋 화이트리스트 목록:\n\n");
+                let mut message = String::from("화이트리스트 목록:\n\n");
                 for (idx, row) in rows.iter().enumerate() {
                     message.push_str(&format!(
                         "{}. ID: {}\n   저장된 이름: {}\n   등록일: {}\n",
@@ -396,7 +394,7 @@ impl TelegramService {
             }
             Err(err) => {
                 tracing::error!(target: "admin", error = %err, "failed to list whitelist");
-                bot.send_message(msg.chat.id, "❌ 화이트리스트 조회 중 오류가 발생했습니다.")
+                bot.send_message(msg.chat.id, "화이트리스트 조회 중 오류가 발생했습니다.")
                     .await?;
             }
         }

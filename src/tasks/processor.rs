@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use teloxide::{prelude::*, types::ParseMode};
 use tokio::{task::JoinHandle, time::sleep};
@@ -61,7 +62,7 @@ impl MessageProcessor {
                 }
                 continue;
             }
-            if let Err(err) = self.handle_batch(batch).await {
+            if let Err(err) = self.handle_batch(batch, shutdown).await {
                 tracing::error!(target: "processor", error = %err, "failed to handle batch");
             }
         }
@@ -69,12 +70,24 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn handle_batch(&self, batch: Vec<MessageJob>) -> Result<()> {
+    async fn handle_batch(
+        &self,
+        batch: Vec<MessageJob>,
+        shutdown: &mut ShutdownListener,
+    ) -> Result<()> {
         tracing::info!(target: "processor", total = batch.len(), "processing batch");
         let mut prompt_entries = Vec::with_capacity(batch.len());
         let mut lookup: HashMap<String, MessageJob> = HashMap::new();
 
         for job in batch {
+            if shutdown.is_triggered() {
+                tracing::info!(
+                    target: "processor",
+                    "shutdown requested while assembling batch; aborting early"
+                );
+                return Ok(());
+            }
+
             let member_flag = if job.is_group_member {
                 "멤버"
             } else {
@@ -92,7 +105,19 @@ impl MessageProcessor {
             );
 
             for url in &job.urls {
-                if let Some(content) = self.web_fetcher.fetch(url).await.ok().flatten() {
+                let content = tokio::select! {
+                    res = self.web_fetcher.fetch(url) => res,
+                    _ = shutdown.notified() => {
+                        tracing::info!(
+                            target: "processor",
+                            url = %url,
+                            "shutdown requested during web fetch; aborting batch"
+                        );
+                        return Ok(());
+                    }
+                }?;
+
+                if let Some(content) = content {
                     entry.push_str("\n웹페이지 정보 (");
                     entry.push_str(url);
                     entry.push_str("):\n");
@@ -109,7 +134,17 @@ impl MessageProcessor {
         }
 
         let prompt = prompt_entries.join("\n\n");
-        let classification = self.cerebras.classify(&prompt).await?;
+        let classification = tokio::select! {
+            res = self.cerebras.classify(&prompt) => res,
+            _ = shutdown.notified() => {
+                tracing::info!(
+                    target: "processor",
+                    "shutdown requested during Cerebras classify call; aborting batch"
+                );
+                return Ok(());
+            }
+        }?;
+
         self.apply_classification(classification, lookup).await
     }
 
@@ -153,37 +188,57 @@ impl MessageProcessor {
 
         if let Some(admin_group_id) = self.config.admin_group_id {
             if admin_group_id != 0 {
-                let formatted = self.format_admin_log(job);
-                let _ = self
+                let deleted_at = Utc::now();
+                let formatted = self.format_admin_log(job, deleted_at);
+                if let Err(err) = self
                     .bot
                     .send_message(ChatId(admin_group_id), formatted)
-                    .parse_mode(ParseMode::MarkdownV2)
-                    .await;
+                    .parse_mode(ParseMode::Html)
+                    .await
+                {
+                    tracing::error!(
+                        target: "processor",
+                        error = %err,
+                        admin_group_id,
+                        chat_id = job.chat_id.0,
+                        message_id = job.message_id.0,
+                        "failed to send admin spam log"
+                    );
+                }
             }
         }
 
         Ok(())
     }
 
-    fn format_admin_log(&self, job: &MessageJob) -> String {
+    fn format_admin_log(&self, job: &MessageJob, deleted_at: DateTime<Utc>) -> String {
         let tz: Tz = self
             .config
             .timezone
             .parse()
             .unwrap_or(chrono_tz::Asia::Seoul);
-        let local_time = job.timestamp.with_timezone(&tz);
+        let sent_time = job.timestamp.with_timezone(&tz);
+        let deleted_time = deleted_at.with_timezone(&tz);
         let user_id = job
             .from_id
             .map(|id| id.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         format!(
-            "🗑️ *스팸 삭제 로그*\n\n🏠 채팅방: {}\n🆔 채팅방 ID: {}\n👤 사용자: {}\n🆔 사용자 ID: {}\n📅 날짜/시간: {}\n\n💬 스팸 메시지:\n\n`{}`",
-            escape_markdown(job.chat_title.as_deref().unwrap_or("Unknown")),
+            "<b>스팸 삭제 로그</b>\n\n\
+             채팅방: {}\n\
+             채팅방 ID: {}\n\
+             사용자: {}\n\
+             사용자 ID: {}\n\
+             메시지 전송 시각: {}\n\
+             삭제 완료 시각: {}\n\n\
+             스팸 메시지:\n<pre>{}</pre>",
+            escape_html(job.chat_title.as_deref().unwrap_or("Unknown")),
             job.chat_id.0,
-            escape_markdown(&job.from_display),
-            escape_markdown(&user_id),
-            local_time.format("%Y-%m-%d %H:%M:%S"),
-            escape_markdown(&job.text)
+            escape_html(&job.from_display),
+            escape_html(&user_id),
+            sent_time.format("%Y-%m-%d %H:%M:%S"),
+            deleted_time.format("%Y-%m-%d %H:%M:%S"),
+            escape_html(&job.text)
         )
     }
 }
@@ -208,15 +263,15 @@ fn format_web_content(content: &WebContent) -> String {
     out
 }
 
-fn escape_markdown(text: &str) -> String {
+fn escape_html(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
-            '_' | '*' | '[' | ']' | '(' | ')' | '~' | '`' | '>' | '#' | '+' | '-' | '=' | '|'
-            | '{' | '}' | '.' | '!' => {
-                escaped.push('\\');
-                escaped.push(ch);
-            }
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
             _ => escaped.push(ch),
         }
     }

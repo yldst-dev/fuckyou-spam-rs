@@ -2,8 +2,8 @@ use std::{path::Path, str::FromStr, time::Duration};
 
 use anyhow::Result;
 use sqlx::{
-    SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    SqlitePool,
 };
 
 pub mod whitelist;

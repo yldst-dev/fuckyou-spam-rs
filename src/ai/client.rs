@@ -3,7 +3,7 @@ use reqwest::Client;
 
 use crate::{config::CerebrasConfig, domain::types::ClassificationMap};
 
-use super::inference::{CEREBRAS_API_URL, build_request, parse_response};
+use super::inference::{build_request, parse_response, CEREBRAS_API_URL};
 
 #[derive(Clone)]
 pub struct CerebrasClient {
@@ -41,20 +41,18 @@ impl CerebrasClient {
             .await?;
 
         // Check status and log error details
-        let response = match http_response.error_for_status() {
-            Ok(resp) => resp,
-            Err(e) => {
-                // Try to get error body for more details
-                let status = http_response.status();
-                let error_text = http_response.text().await.unwrap_or_default();
-                tracing::error!(
-                    status = %status,
-                    error_body = %error_text,
-                    "Cerebras API request failed"
-                );
-                return Err(e).context(format!("Cerebras API error {}: {}", status, error_text));
-            }
-        };
+        if let Err(err) = http_response.error_for_status_ref() {
+            let status = http_response.status();
+            let error_text = http_response.text().await.unwrap_or_default();
+            tracing::error!(
+                status = %status,
+                error_body = %error_text,
+                "Cerebras API request failed"
+            );
+            return Err(err).context(format!("Cerebras API error {}: {}", status, error_text));
+        }
+
+        let response = http_response;
 
         let classification = parse_response(response).await?;
         Ok(classification)

@@ -50,7 +50,7 @@ pub fn install_signal_handlers(shutdown: Shutdown) {
 
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
         let term = shutdown.clone();
         tokio::spawn(async move {
             if let Ok(mut sig) = signal(SignalKind::terminate()) {

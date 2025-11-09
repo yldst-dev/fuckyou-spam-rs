@@ -9,7 +9,7 @@ use teloxide::{
 use crate::{
     config::AppConfig,
     db::whitelist::WhitelistRepository,
-    domain::{MessageJob, types::QueueSnapshot},
+    domain::{types::QueueSnapshot, MessageJob},
     tasks::queue::MessageQueue,
 };
 

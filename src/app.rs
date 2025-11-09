@@ -4,8 +4,11 @@ use anyhow::Result;
 use chrono::Utc;
 use chrono_tz::Tz;
 use reqwest::Client;
-use teloxide::prelude::*;
-use tokio::{task::JoinHandle, time::sleep};
+use teloxide::{prelude::*, types::ParseMode};
+use tokio::{
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
 use tokio_cron_scheduler::JobScheduler;
 
 use crate::{
@@ -17,7 +20,7 @@ use crate::{
     tasks::{
         processor::MessageProcessor,
         queue::MessageQueue,
-        scheduler::{RestartCallback, configure_restart_jobs},
+        scheduler::{configure_restart_jobs, RestartCallback},
     },
     telegram::TelegramService,
     web_content::WebContentFetcher,
@@ -30,6 +33,8 @@ pub struct SpamGuardApp {
     telegram: TelegramService,
     whitelist: Arc<WhitelistRepository>,
     shutdown: Shutdown,
+    config: Arc<AppConfig>,
+    bot: Bot,
 }
 
 impl SpamGuardApp {
@@ -76,7 +81,8 @@ impl SpamGuardApp {
         ));
         let processor_handle = processor.clone().spawn(shutdown.subscribe());
 
-        let restart_callback = build_restart_callback(bot, config.clone(), whitelist.clone());
+        let restart_callback =
+            build_restart_callback(bot.clone(), config.clone(), whitelist.clone());
         let scheduler =
             configure_restart_jobs(&config.scheduler.cron_specs, restart_callback).await?;
 
@@ -87,6 +93,8 @@ impl SpamGuardApp {
             telegram,
             whitelist,
             shutdown,
+            config,
+            bot,
         })
     }
 
@@ -94,21 +102,26 @@ impl SpamGuardApp {
         let SpamGuardApp {
             _paths: _,
             mut scheduler,
-            processor_handle,
+            mut processor_handle,
             telegram,
             whitelist,
             shutdown,
+            config,
+            bot,
         } = self;
 
-        tracing::info!("🚀 텔레그램 스팸 감지 봇 (Rust) 시작");
+        tracing::info!("텔레그램 스팸 감지 봇 (Rust) 시작");
+
+        notify_admin_group(&bot, config.as_ref(), "스팸 감지 봇이 시작되었습니다.").await;
 
         let mut shutdown_listener = shutdown.subscribe();
+        let shutdown_timeout = Duration::from_secs(5);
         let mut telegram_future = Box::pin(telegram.run(shutdown.subscribe()));
         let mut telegram_completed = false;
 
         tokio::select! {
             _ = shutdown_listener.notified() => {
-                tracing::info!("🛑 종료 신호 감지 (CTRL+C / SIGTERM)");
+                tracing::info!("종료 신호 감지 (CTRL+C / SIGTERM)");
             }
             res = &mut telegram_future => {
                 telegram_completed = true;
@@ -123,24 +136,68 @@ impl SpamGuardApp {
         shutdown.trigger();
 
         if !telegram_completed {
-            if let Err(err) = telegram_future.await {
-                tracing::error!(?err, "Telegram dispatcher 종료 중 오류");
+            let wait = tokio::time::sleep(shutdown_timeout);
+            tokio::pin!(wait);
+            tokio::select! {
+                res = &mut telegram_future => {
+                    if let Err(err) = res {
+                        tracing::error!(?err, "Telegram dispatcher 종료 중 오류");
+                    }
+                }
+                _ = &mut wait => {
+                    tracing::warn!(
+                        target: "telegram",
+                        "Telegram dispatcher did not stop within {:?}; forcing exit",
+                        shutdown_timeout
+                    );
+                }
             }
         }
 
-        if let Err(err) = scheduler.shutdown().await {
-            tracing::error!(?err, "스케줄러 종료 실패");
-        }
-
-        whitelist.close().await;
-
-        if let Err(err) = processor_handle.await {
-            if err.is_panic() {
-                tracing::error!("메시지 처리기 작업이 패닉으로 종료되었습니다");
+        match timeout(shutdown_timeout, scheduler.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::error!(?err, "스케줄러 종료 실패");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "scheduler",
+                    "스케줄러 종료가 {:?} 내에 완료되지 않았습니다.",
+                    shutdown_timeout
+                );
             }
         }
 
-        tracing::info!("✅ 봇 종료 완료");
+        if let Err(_) = timeout(shutdown_timeout, whitelist.close()).await {
+            tracing::warn!(
+                target: "db",
+                "화이트리스트 리소스 정리가 {:?} 내에 완료되지 않았습니다.",
+                shutdown_timeout
+            );
+        }
+
+        let processor_sleep = tokio::time::sleep(shutdown_timeout);
+        tokio::pin!(processor_sleep);
+        tokio::select! {
+            res = &mut processor_handle => {
+                if let Err(err) = res {
+                    if err.is_panic() {
+                        tracing::error!("메시지 처리기 작업이 패닉으로 종료되었습니다");
+                    }
+                }
+            }
+            _ = &mut processor_sleep => {
+                tracing::warn!(
+                    target: "processor",
+                    "메시지 처리기 종료가 {:?} 내에 완료되지 않아 작업을 중단합니다",
+                    shutdown_timeout
+                );
+                processor_handle.abort();
+            }
+        }
+
+        tracing::info!("봇 종료 완료");
+        notify_admin_group(&bot, config.as_ref(), "스팸 감지 봇이 종료되었습니다.").await;
         Ok(())
     }
 }
@@ -157,17 +214,31 @@ fn build_restart_callback(
         tokio::spawn(async move {
             let tz: Tz = config.timezone.parse().unwrap_or(chrono_tz::Asia::Seoul);
             let ts = Utc::now().with_timezone(&tz).format("%Y-%m-%d %H:%M:%S");
-            if let Some(admin_group_id) = config.admin_group_id {
-                let _ = bot
-                    .send_message(
-                        ChatId(admin_group_id),
-                        format!("🔄 자동 재부팅 시작\n⏰ 시각: {ts}"),
-                    )
-                    .await;
-            }
+            let message = format!("자동 재부팅을 시작합니다.\n현재 시각: {ts}");
+            notify_admin_group(&bot, config.as_ref(), &message).await;
             whitelist.close().await;
             sleep(Duration::from_secs(5)).await;
             process::exit(0);
         });
     })
+}
+
+async fn notify_admin_group(bot: &Bot, config: &AppConfig, text: &str) {
+    if let Some(admin_group_id) = config.admin_group_id {
+        if admin_group_id == 0 {
+            return;
+        }
+        if let Err(err) = bot
+            .send_message(ChatId(admin_group_id), text)
+            .parse_mode(ParseMode::Html)
+            .await
+        {
+            tracing::warn!(
+                target: "telegram",
+                error = %err,
+                admin_group_id,
+                "failed to send admin notification"
+            );
+        }
+    }
 }

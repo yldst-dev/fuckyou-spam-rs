@@ -2,7 +2,7 @@ use std::io;
 
 use anyhow::Result;
 use once_cell::sync::OnceCell;
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::{config::AppConfig, infrastructure::directories::ResolvedPaths};
 
