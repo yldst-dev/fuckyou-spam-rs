@@ -1,4 +1,4 @@
-use std::{process, sync::Arc, time::Duration};
+use std::{env, path::PathBuf, process, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -211,6 +211,9 @@ fn build_restart_callback(
         let bot = bot.clone();
         let config = config.clone();
         let whitelist = whitelist.clone();
+        let mut arg_iter = env::args();
+        let restart_cmd_path = arg_iter.next().map(PathBuf::from);
+        let restart_args: Vec<String> = arg_iter.collect();
         tokio::spawn(async move {
             let tz: Tz = config.timezone.parse().unwrap_or(chrono_tz::Asia::Seoul);
             let ts = Utc::now().with_timezone(&tz).format("%Y-%m-%d %H:%M:%S");
@@ -218,6 +221,46 @@ fn build_restart_callback(
             notify_admin_group(&bot, config.as_ref(), &message).await;
             whitelist.close().await;
             sleep(Duration::from_secs(5)).await;
+            let restart_target = restart_cmd_path.or_else(|| env::current_exe().ok());
+            let Some(executable) = restart_target else {
+                tracing::error!(target: "scheduler", "failed to determine executable path for restart");
+                notify_admin_group(
+                    &bot,
+                    config.as_ref(),
+                    "자동 재부팅 실패: 실행 파일 경로를 찾을 수 없습니다.",
+                )
+                .await;
+                return;
+            };
+
+            tracing::info!(
+                target: "scheduler",
+                command = %executable.display(),
+                args_count = restart_args.len(),
+                "spawning replacement process for restart",
+            );
+
+            let mut command = process::Command::new(&executable);
+            if !restart_args.is_empty() {
+                command.args(&restart_args);
+            }
+
+            if let Err(err) = command.spawn() {
+                tracing::error!(
+                    target: "scheduler",
+                    command = %executable.display(),
+                    ?err,
+                    "failed to spawn replacement process",
+                );
+                notify_admin_group(
+                    &bot,
+                    config.as_ref(),
+                    "자동 재부팅 실패: 새 프로세스를 시작할 수 없습니다.",
+                )
+                .await;
+                return;
+            }
+
             process::exit(0);
         });
     })
