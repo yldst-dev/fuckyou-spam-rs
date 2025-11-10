@@ -91,3 +91,104 @@ jobs:
         files: lcov.info
         fail_ci_if_error: false
         token: ${{ secrets.CODECOV_TOKEN }}
+
+  build-binaries:
+    name: Cross-Platform Build
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive_name: fuckyou-spam-rust-linux-x86_64.tar.gz
+            artifact_name: fuckyou-spam-rust-linux-x86_64
+            binary: fuckyou-spam-rust
+          - os: macos-latest
+            archive_name: fuckyou-spam-rust-macos-universal.tar.gz
+            artifact_name: fuckyou-spam-rust-macos-universal
+            binary: fuckyou-spam-rust
+          - os: windows-latest
+            archive_name: fuckyou-spam-rust-windows-x86_64.zip
+            artifact_name: fuckyou-spam-rust-windows-x86_64
+            binary: fuckyou-spam-rust.exe
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target/
+        key: ${{ runner.os }}-build-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-build-
+
+    - name: Build release binary
+      run: cargo build --release
+
+    - name: Archive binary (Unix)
+      if: runner.os != 'Windows'
+      run: |
+        cd target/release
+        tar czf ../../${{ matrix.archive_name }} ${{ matrix.binary }}
+
+    - name: Archive binary (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        cd target\release
+        7z a ..\..\${{ matrix.archive_name }} ${{ matrix.binary }}
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}
+        path: ${{ matrix.archive_name }}
+
+  build-rocky:
+    name: Rocky Linux Build
+    needs: test
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+    - name: Install base tools
+      run: |
+        set -eux
+        dnf -y install git curl gcc gcc-c++ make pkgconf-pkg-config openssl-devel sqlite sqlite-devel zlib-devel tar gzip xz which
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: rocky-linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          rocky-linux-cargo-
+
+    - name: Build release binary
+      run: cargo build --release --locked
+
+    - name: Archive binary
+      run: |
+        cd target/release
+        tar czf ../../fuckyou-spam-rust-rocky-linux-x86_64.tar.gz fuckyou-spam-rust
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: fuckyou-spam-rust-rocky-linux-x86_64
+        path: fuckyou-spam-rust-rocky-linux-x86_64.tar.gz
