@@ -162,7 +162,8 @@ jobs:
     - name: Install base tools
       run: |
         set -eux
-        dnf -y install git curl gcc gcc-c++ make pkgconf-pkg-config openssl-devel sqlite sqlite-devel zlib-devel tar gzip xz which
+        dnf -y update --nobest || true
+        dnf -y install --allowerasing git curl gcc gcc-c++ make pkgconf-pkg-config openssl-devel sqlite sqlite-devel zlib-devel tar gzip xz which
     - uses: actions/checkout@v4
 
     - name: Install Rust
