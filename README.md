@@ -346,6 +346,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [SQLx](https://github.com/launchbadge/sqlx) - Async SQL toolkit
 - Original [TypeScript implementation](https://github.com/yldst-dev/fuckyou-spam) - The foundation and inspiration
 
+## 📋 TODO
+
+- [ ] 해당 메시지가 차단된 이유(reason)가 관리자 그룹에 표시되도록 하는 기능 추가
+
 ## 📞 Support
 
 If you encounter any issues or have questions:
