@@ -61,6 +61,8 @@ jobs:
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
 
     - name: Install cargo-audit
       run: cargo install cargo-audit
@@ -77,6 +79,7 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
+        toolchain: stable
         components: llvm-tools-preview
 
     - name: Install cargo-llvm-cov
@@ -112,6 +115,8 @@ jobs:
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
 
     - name: Cache dependencies
       uses: actions/cache@v4
@@ -157,6 +162,8 @@ jobs:
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
 
     - name: Cache dependencies
       uses: actions/cache@v4
