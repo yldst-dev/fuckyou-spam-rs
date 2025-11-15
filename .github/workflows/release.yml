@@ -53,11 +53,7 @@ jobs:
             target: aarch64-apple-darwin
             artifact_name: fuckyou-spam-rust
             asset_name: fuckyou-spam-rust-macos-aarch64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: fuckyou-spam-rust.exe
-            asset_name: fuckyou-spam-rust-windows-x86_64.exe
-
+          
     steps:
     - uses: actions/checkout@v4
 
@@ -97,8 +93,7 @@ jobs:
     - name: Build binary
       run: cargo build --release --target ${{ matrix.target }}
 
-    - name: Strip binary (Unix)
-      if: runner.os != 'Windows'
+    - name: Strip binary
       run: |
         if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
           STRIP=aarch64-linux-gnu-strip
@@ -113,14 +108,12 @@ jobs:
         cd target/${{ matrix.target }}/release
         tar czf ../../../../${{ matrix.asset_name }}.tar.gz ${{ matrix.artifact_name }}
 
-    - name: Create archive (Windows)
-      if: runner.os == 'Windows'
+    - name: Create archive
       run: |
         cd target/${{ matrix.target }}/release
-        7z a ../../../../${{ matrix.asset_name }}.zip ${{ matrix.artifact_name }}
+        tar czf ../../../../${{ matrix.asset_name }}.tar.gz ${{ matrix.artifact_name }}
 
-    - name: Upload Release Asset (Unix)
-      if: runner.os != 'Windows'
+    - name: Upload Release Asset
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -129,17 +122,6 @@ jobs:
         asset_path: ./${{ matrix.asset_name }}.tar.gz
         asset_name: ${{ matrix.asset_name }}.tar.gz
         asset_content_type: application/gzip
-
-    - name: Upload Release Asset (Windows)
-      if: runner.os == 'Windows'
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ needs.create-release.outputs.upload_url }}
-        asset_path: ./${{ matrix.asset_name }}.zip
-        asset_name: ${{ matrix.asset_name }}.zip
-        asset_content_type: application/zip
 
   build-docker:
     name: Build Docker Images
