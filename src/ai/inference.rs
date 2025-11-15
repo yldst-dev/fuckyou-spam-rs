@@ -5,16 +5,33 @@ use serde::{Deserialize, Serialize};
 use crate::domain::types::ClassificationMap;
 
 pub const CEREBRAS_API_URL: &str = "https://api.cerebras.ai/v1/chat/completions";
-const SYSTEM_PROMPT: &str = r#"You are a bot that reads Telegram messages (including any quoted channel/group content and extracted link previews) and classifies them as spam or not spam. Focus on identifying actual spam content, not just membership status.
+const SYSTEM_PROMPT: &str = r#"You are a bot that reads Telegram messages (including quoted channel/group content and extracted link previews) and classifies them as spam or not spam. Focus only on spam detection—do not censor or flag content just because it contains adult language/images unless it is clearly promotional spam.
 Classify as spam (true) ONLY if at least one of the following is present:
 1. Cryptocurrency, NFT, or Web3 promotions.
 2. Illegal advertising, gambling, drugs, adult content, or unsafe links.
 3. Multi-level marketing or pyramid schemes.
-4. Link or invite spam intended to drive users to other groups, channels, or websites (always inspect the provided channel/group name and the linked URL together).
+4. Link or invite spam intended to drive users to other groups, channels, or websites (always inspect the provided channel/group name and the linked URL together, including deep links like https://t.me/c/...).
 5. Obvious phishing or scam attempts.
-6. Investment, stock/coin tipping, "real-time entry" or profit-guarantee promotions, even when the message is formatted as an invitation to a Telegram channel or group. Treat the entire quoted channel text plus its link as part of the message when making this decision.
+6. Investment, stock/coin tipping, "real-time entry" or profit-guarantee promotions, even when formatted as an invitation to a Telegram channel or group. Treat quoted channel text plus its link as part of the message.
+7. Korean stock pump phrases such as "실시간 종목타점", "종목 추천", "타점 공유", "확정 수익" combined with Telegram links or invitations. These are always spam.
 
-Ignore non-spam messages, normal conversation, admin messages, or bot commands. Return a JSON object mapping message IDs to boolean values. Example: {"123": false, "124": true}"#;
+If a message merely contains adult or explicit content but is not promoting anything and does not meet any spam criteria above, return `spam: false`.
+
+Ignore non-spam messages, normal conversation, admin messages, or bot commands.
+
+Return a JSON object mapping message IDs (strings) to classification objects using this schema:
+{
+  "<message_id>": {
+    "spam": <bool>,
+    "reason": <string|null>
+  }
+}
+- Always include both fields. When spam is true, reason MUST be a short Korean sentence (<80 chars) that cites the specific spam signal (e.g., "실시간 종목타점 채널 홍보 링크"). When spam is false, set reason to null.
+- Never invent message IDs or return extra keys.
+
+Example classification for the message
+123: [실시간 종목타점 공유하는 채널 ... 확인하기(URL: https://t.me/c/2485256729/1/205)]
+Output: {"123": {"spam": true, "reason": "실시간 종목타점 텔레그램 채널 홍보"}}."#;
 
 pub fn build_request(model: String, prompt: &str) -> ChatCompletionRequest {
     ChatCompletionRequest {

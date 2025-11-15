@@ -9,7 +9,7 @@ use tokio::{task::JoinHandle, time::sleep};
 use crate::{
     ai::CerebrasClient,
     config::AppConfig,
-    domain::{ClassificationMap, MessageJob, WebContent},
+    domain::{ClassificationDecision, ClassificationMap, MessageJob, WebContent},
     infrastructure::shutdown::ShutdownListener,
     tasks::queue::MessageQueue,
     web_content::WebContentFetcher,
@@ -153,12 +153,13 @@ impl MessageProcessor {
         classification: ClassificationMap,
         mut lookup: HashMap<String, MessageJob>,
     ) -> Result<()> {
-        for (message_id, is_spam) in classification {
-            if !is_spam {
+        for (message_id, ClassificationDecision { spam, reason }) in classification {
+            if !spam {
                 continue;
             }
             if let Some(job) = lookup.remove(&message_id) {
-                if let Err(err) = self.delete_spam(&job).await {
+                let reason_text = reason.as_deref();
+                if let Err(err) = self.delete_spam(&job, reason_text).await {
                     tracing::error!(
                         target: "processor",
                         error = %err,
@@ -172,7 +173,7 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn delete_spam(&self, job: &MessageJob) -> Result<()> {
+    async fn delete_spam(&self, job: &MessageJob, reason: Option<&str>) -> Result<()> {
         self.bot
             .delete_message(job.chat_id, job.message_id)
             .await
@@ -189,7 +190,7 @@ impl MessageProcessor {
         if let Some(admin_group_id) = self.config.admin_group_id {
             if admin_group_id != 0 {
                 let deleted_at = Utc::now();
-                let formatted = self.format_admin_log(job, deleted_at);
+                let formatted = self.format_admin_log(job, deleted_at, reason);
                 if let Err(err) = self
                     .bot
                     .send_message(ChatId(admin_group_id), formatted)
@@ -211,7 +212,12 @@ impl MessageProcessor {
         Ok(())
     }
 
-    fn format_admin_log(&self, job: &MessageJob, deleted_at: DateTime<Utc>) -> String {
+    fn format_admin_log(
+        &self,
+        job: &MessageJob,
+        deleted_at: DateTime<Utc>,
+        reason: Option<&str>,
+    ) -> String {
         let tz: Tz = self
             .config
             .timezone
@@ -231,14 +237,16 @@ impl MessageProcessor {
              사용자 ID: {}\n\
              메시지 전송 시각: {}\n\
              삭제 완료 시각: {}\n\n\
-             스팸 메시지:\n<pre>{}</pre>",
+             스팸 메시지:\n<pre>{}</pre>\n\
+             삭제 사유:\n<pre>{}</pre>",
             escape_html(job.chat_title.as_deref().unwrap_or("Unknown")),
             job.chat_id.0,
             escape_html(&job.from_display),
             escape_html(&user_id),
             sent_time.format("%Y-%m-%d %H:%M:%S"),
             deleted_time.format("%Y-%m-%d %H:%M:%S"),
-            escape_html(&job.text)
+            escape_html(&job.text),
+            escape_html(reason.unwrap_or("모델이 사유를 제공하지 않았습니다."))
         )
     }
 }

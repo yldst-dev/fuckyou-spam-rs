@@ -9,7 +9,14 @@ pub struct WebContent {
     pub content: Option<String>,
 }
 
-pub type ClassificationMap = HashMap<String, bool>;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassificationDecision {
+    pub spam: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+pub type ClassificationMap = HashMap<String, ClassificationDecision>;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct QueueSnapshot {

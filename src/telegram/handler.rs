@@ -11,7 +11,7 @@ use teloxide::{
     update_listeners,
     utils::command::BotCommands,
 };
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant};
 
 use crate::{
     config::AppConfig,
@@ -267,7 +267,11 @@ impl TelegramService {
             })
             .build();
 
-        let listener = update_listeners::polling_default(self.bot.clone()).await;
+        let listener = update_listeners::Polling::builder(self.bot.clone())
+            .timeout(Duration::from_secs(3))
+            .delete_webhook()
+            .await
+            .build();
         let watchdog = UpdateListenerWatchdog::new(
             self.bot.clone(),
             self.state.config.clone(),
@@ -512,6 +516,12 @@ impl TelegramService {
                 };
                 match state.whitelist.add_or_replace(entry).await {
                     Ok(true) => {
+                        tracing::info!(
+                            target: "admin",
+                            chat_id = target_chat_id,
+                            added_by = msg.from.as_ref().map(user_to_i64),
+                            "whitelist entry added"
+                        );
                         bot.send_message(
                             msg.chat.id,
                             format!("그룹 (ID: {target_chat_id})이 화이트리스트에 추가되었습니다."),
@@ -548,6 +558,12 @@ impl TelegramService {
     ) -> BotResult<()> {
         match state.whitelist.remove(target_chat_id).await {
             Ok(true) => {
+                tracing::info!(
+                    target: "admin",
+                    chat_id = target_chat_id,
+                    removed_by = msg.from.as_ref().map(user_to_i64),
+                    "whitelist entry removed"
+                );
                 bot.send_message(
                     msg.chat.id,
                     format!("그룹 (ID: {target_chat_id})이 화이트리스트에서 제거되었습니다."),
