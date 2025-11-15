@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::Utc;
 use chrono_tz::Tz;
 use reqwest::Client;
-use teloxide::{prelude::*, types::ParseMode};
+use teloxide::prelude::*;
 use tokio::{
     task::JoinHandle,
     time::{sleep, timeout},
@@ -16,7 +16,9 @@ use crate::{
     config::AppConfig,
     db::{self, whitelist::WhitelistRepository},
     domain::{MessageJob, QueueSnapshot},
-    infrastructure::{directories::ResolvedPaths, shutdown::Shutdown},
+    infrastructure::{
+        directories::ResolvedPaths, notifier::notify_admin_group, shutdown::Shutdown,
+    },
     tasks::{
         processor::MessageProcessor,
         queue::MessageQueue,
@@ -64,12 +66,15 @@ impl SpamGuardApp {
             Arc::new(move || queue.snapshot())
         };
 
+        let restart_callback =
+            build_restart_callback(bot.clone(), config.clone(), whitelist.clone());
         let telegram = TelegramService::new(
             bot.clone(),
             config.clone(),
             whitelist.clone(),
             queue.clone(),
             queue_snapshot_provider,
+            restart_callback.clone(),
         );
 
         let processor = Arc::new(MessageProcessor::new(
@@ -81,8 +86,6 @@ impl SpamGuardApp {
         ));
         let processor_handle = processor.clone().spawn(shutdown.subscribe());
 
-        let restart_callback =
-            build_restart_callback(bot.clone(), config.clone(), whitelist.clone());
         let scheduler =
             configure_restart_jobs(&config.scheduler.cron_specs, restart_callback).await?;
 
@@ -264,24 +267,4 @@ fn build_restart_callback(
             process::exit(0);
         });
     })
-}
-
-async fn notify_admin_group(bot: &Bot, config: &AppConfig, text: &str) {
-    if let Some(admin_group_id) = config.admin_group_id {
-        if admin_group_id == 0 {
-            return;
-        }
-        if let Err(err) = bot
-            .send_message(ChatId(admin_group_id), text)
-            .parse_mode(ParseMode::Html)
-            .await
-        {
-            tracing::warn!(
-                target: "telegram",
-                error = %err,
-                admin_group_id,
-                "failed to send admin notification"
-            );
-        }
-    }
 }

@@ -5,13 +5,14 @@ use serde::{Deserialize, Serialize};
 use crate::domain::types::ClassificationMap;
 
 pub const CEREBRAS_API_URL: &str = "https://api.cerebras.ai/v1/chat/completions";
-const SYSTEM_PROMPT: &str = r#"You are a bot that reads Telegram messages and classifies them as spam or not spam. Focus on identifying actual spam content, not just membership status.
-Classify as spam (true) ONLY if:
-1. Cryptocurrency, NFT, or Web3 promotions
-2. Illegal advertising, gambling, drugs, adult content, or unsafe links
-3. Multi-level marketing or pyramid schemes
-4. Link or invite spam intended to drive users to other groups or websites
-5. Obvious phishing or scam attempts
+const SYSTEM_PROMPT: &str = r#"You are a bot that reads Telegram messages (including any quoted channel/group content and extracted link previews) and classifies them as spam or not spam. Focus on identifying actual spam content, not just membership status.
+Classify as spam (true) ONLY if at least one of the following is present:
+1. Cryptocurrency, NFT, or Web3 promotions.
+2. Illegal advertising, gambling, drugs, adult content, or unsafe links.
+3. Multi-level marketing or pyramid schemes.
+4. Link or invite spam intended to drive users to other groups, channels, or websites (always inspect the provided channel/group name and the linked URL together).
+5. Obvious phishing or scam attempts.
+6. Investment, stock/coin tipping, "real-time entry" or profit-guarantee promotions, even when the message is formatted as an invitation to a Telegram channel or group. Treat the entire quoted channel text plus its link as part of the message when making this decision.
 
 Ignore non-spam messages, normal conversation, admin messages, or bot commands. Return a JSON object mapping message IDs to boolean values. Example: {"123": false, "124": true}"#;
 

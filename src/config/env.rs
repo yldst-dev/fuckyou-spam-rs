@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub timezone: String,
     pub scheduler: SchedulerConfig,
     pub web: WebContentConfig,
+    pub resilience: ResilienceConfig,
+    pub update: UpdateConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +47,22 @@ pub struct WebContentConfig {
     pub max_urls_per_message: usize,
     pub fetch_timeout: Duration,
     pub content_max_length: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResilienceConfig {
+    pub network_error_threshold: u32,
+    pub network_error_window: Duration,
+    pub restart_cooldown: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateConfig {
+    pub enabled: bool,
+    pub check_on_startup: bool,
+    pub auto_restart: bool,
+    pub repo_owner: String,
+    pub repo_name: String,
 }
 
 #[derive(Debug, Error)]

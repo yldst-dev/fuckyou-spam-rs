@@ -1,10 +1,14 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use futures::future::BoxFuture;
+use parking_lot::Mutex;
 use teloxide::{
     dispatching::Dispatcher,
+    error_handlers::ErrorHandler,
     prelude::*,
     types::{BotCommandScope, ChatId, Message, Recipient},
+    update_listeners,
     utils::command::BotCommands,
 };
 use tokio::time::Instant;
@@ -13,8 +17,8 @@ use crate::{
     config::AppConfig,
     db::whitelist::{WhitelistEntry, WhitelistRepository},
     domain::MessageJob,
-    infrastructure::shutdown::ShutdownListener,
-    tasks::queue::MessageQueue,
+    infrastructure::{notifier::notify_admin_group, shutdown::ShutdownListener},
+    tasks::{queue::MessageQueue, scheduler::RestartCallback},
 };
 
 use super::{
@@ -25,6 +29,185 @@ use super::{
 pub struct TelegramService {
     bot: Bot,
     state: Arc<AppState>,
+    restart_callback: RestartCallback,
+}
+
+#[derive(Default)]
+struct WatchdogState {
+    first_error_at: Option<Instant>,
+    consecutive_errors: u32,
+    last_restart_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NetworkIssueKind {
+    Timeout,
+    Connection,
+    Other,
+}
+
+impl NetworkIssueKind {
+    fn label(&self) -> &'static str {
+        match self {
+            NetworkIssueKind::Timeout => "요청 타임아웃",
+            NetworkIssueKind::Connection => "TCP 연결 실패",
+            NetworkIssueKind::Other => "기타 네트워크 오류",
+        }
+    }
+}
+
+struct NetworkIssueInfo {
+    kind: NetworkIssueKind,
+    url: Option<String>,
+    detail: String,
+}
+
+struct UpdateListenerWatchdog {
+    bot: Bot,
+    config: Arc<AppConfig>,
+    restart_callback: RestartCallback,
+    state: Mutex<WatchdogState>,
+}
+
+impl UpdateListenerWatchdog {
+    fn new(bot: Bot, config: Arc<AppConfig>, restart_callback: RestartCallback) -> Arc<Self> {
+        Arc::new(Self {
+            bot,
+            config,
+            restart_callback,
+            state: Mutex::new(WatchdogState::default()),
+        })
+    }
+
+    async fn process_error(self: Arc<Self>, error: teloxide::RequestError) {
+        if let Some(info) = Self::classify_network_issue(&error) {
+            self.handle_network_failure(info, error).await;
+        } else {
+            tracing::error!(
+                target: "telegram",
+                error = %error,
+                "update listener error"
+            );
+        }
+    }
+
+    fn classify_network_issue(error: &teloxide::RequestError) -> Option<NetworkIssueInfo> {
+        match error {
+            teloxide::RequestError::Network(source) => {
+                let req_err = source.as_ref();
+                let kind = if req_err.is_timeout() {
+                    NetworkIssueKind::Timeout
+                } else if req_err.is_connect() {
+                    NetworkIssueKind::Connection
+                } else {
+                    NetworkIssueKind::Other
+                };
+                let url = req_err.url().map(|u| u.to_string());
+                Some(NetworkIssueInfo {
+                    kind,
+                    url,
+                    detail: req_err.to_string(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    async fn handle_network_failure(&self, info: NetworkIssueInfo, error: teloxide::RequestError) {
+        let now = Instant::now();
+        let mut restart_decision: Option<(u32, std::time::Duration)> = None;
+        {
+            let mut state = self.state.lock();
+            let window = self.config.resilience.network_error_window;
+
+            if state
+                .first_error_at
+                .map(|ts| now.duration_since(ts) > window)
+                .unwrap_or(true)
+            {
+                state.first_error_at = Some(now);
+                state.consecutive_errors = 0;
+            }
+
+            state.consecutive_errors = state.consecutive_errors.saturating_add(1);
+            let consecutive = state.consecutive_errors;
+            let first_error_at = state.first_error_at.unwrap_or(now);
+            let elapsed = now.duration_since(first_error_at);
+
+            tracing::error!(
+                target: "telegram",
+                issue = info.kind.label(),
+                url = info.url.as_deref(),
+                consecutive,
+                error = %error,
+                "Telegram polling network failure"
+            );
+
+            if consecutive >= self.config.resilience.network_error_threshold {
+                if state
+                    .last_restart_at
+                    .map(|ts| now.duration_since(ts) < self.config.resilience.restart_cooldown)
+                    .unwrap_or(false)
+                {
+                    tracing::warn!(
+                        target: "telegram",
+                        cooldown_secs = self.config.resilience.restart_cooldown.as_secs(),
+                        "Emergency restart skipped due to cooldown"
+                    );
+                } else {
+                    state.last_restart_at = Some(now);
+                    state.first_error_at = None;
+                    state.consecutive_errors = 0;
+                    restart_decision = Some((consecutive, elapsed));
+                }
+            }
+        }
+
+        let Some((consecutive, elapsed)) = restart_decision else {
+            return;
+        };
+
+        tracing::warn!(
+            target: "telegram",
+            consecutive,
+            elapsed_secs = elapsed.as_secs(),
+            "Triggered emergency restart after repeated network failures"
+        );
+
+        let summary = self.build_summary(&info, &error, consecutive, elapsed);
+        notify_admin_group(&self.bot, self.config.as_ref(), &summary).await;
+
+        (self.restart_callback)();
+    }
+
+    fn build_summary(
+        &self,
+        info: &NetworkIssueInfo,
+        error: &teloxide::RequestError,
+        consecutive: u32,
+        elapsed: std::time::Duration,
+    ) -> String {
+        let elapsed_secs = elapsed.as_secs();
+        let mut message = format!(
+            "텔레그램 업데이트 리스너가 최근 {elapsed_secs}초 동안 {consecutive}회 연속으로 {kind}를 보고했습니다.",
+            kind = info.kind.label()
+        );
+        if let Some(url) = info.url.as_deref() {
+            message.push_str(&format!("\n- 마지막 요청 URL: {url}"));
+        }
+        message.push_str(&format!("\n- reqwest 상세: {}", info.detail));
+        message.push_str(&format!("\n- teloxide 오류: {error}"));
+        message.push_str("\n네트워크가 복구되지 않아 즉시 봇을 재시작합니다.");
+        message
+    }
+}
+
+impl ErrorHandler<teloxide::RequestError> for UpdateListenerWatchdog {
+    fn handle_error(self: Arc<Self>, error: teloxide::RequestError) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            self.process_error(error).await;
+        })
+    }
 }
 
 impl TelegramService {
@@ -34,6 +217,7 @@ impl TelegramService {
         whitelist: Arc<WhitelistRepository>,
         queue: Arc<MessageQueue<MessageJob>>,
         queue_snapshot: QueueSnapshotProvider,
+        restart_callback: RestartCallback,
     ) -> Self {
         let state = Arc::new(AppState {
             config,
@@ -41,7 +225,11 @@ impl TelegramService {
             queue,
             queue_snapshot,
         });
-        Self { bot, state }
+        Self {
+            bot,
+            state,
+            restart_callback,
+        }
     }
 
     pub async fn run(&self, mut shutdown: ShutdownListener) -> Result<()> {
@@ -79,8 +267,15 @@ impl TelegramService {
             })
             .build();
 
+        let listener = update_listeners::polling_default(self.bot.clone()).await;
+        let watchdog = UpdateListenerWatchdog::new(
+            self.bot.clone(),
+            self.state.config.clone(),
+            self.restart_callback.clone(),
+        );
+
         let shutdown_token = dispatcher.shutdown_token();
-        let mut dispatcher_future = Box::pin(dispatcher.dispatch());
+        let mut dispatcher_future = Box::pin(dispatcher.dispatch_with_listener(listener, watchdog));
         let mut dispatcher_finished = false;
 
         tokio::select! {

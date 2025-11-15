@@ -66,7 +66,22 @@ WEBPAGE_FETCH_TIMEOUT=10000
 MAX_URLS_PER_MESSAGE=2
 RESTART_SCHEDULE=0 2 * * *
 TIMEZONE=Asia/Seoul
+
+# Auto-update (disabled by default)
+AUTO_UPDATE_ENABLED=false
+AUTO_UPDATE_CHECK_ON_STARTUP=true
+AUTO_UPDATE_AUTO_RESTART=true
+AUTO_UPDATE_REPO_OWNER=yldst-dev
+AUTO_UPDATE_REPO_NAME=fuckyou-spam-rs
 ```
+
+> **Auto Update**
+> When `AUTO_UPDATE_ENABLED=true`, the bot checks the latest GitHub release for the configured
+> repository on startup (Linux/macOS targets). If a newer binary exists, it is downloaded into
+> `data/updates/`, swapped into the current install directory, and optionally re-exec'd immediately
+> when `AUTO_UPDATE_AUTO_RESTART=true`. If `ADMIN_GROUP_ID` is set, the bot sends a status message
+> (old/new versions + restart plan) to that group after the binary swap. Disable the flag when
+> running from `cargo run` or inside container builds where self-updates are undesired.
 
 ### 4. Run the Bot
 

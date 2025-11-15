@@ -7,6 +7,7 @@ use crate::config::DirectoryConfig;
 #[derive(Debug, Clone)]
 pub struct ResolvedPaths {
     pub logs_dir: PathBuf,
+    pub data_dir: PathBuf,
     pub db_path: PathBuf,
 }
 
@@ -18,8 +19,11 @@ pub fn ensure_directories(cfg: &DirectoryConfig) -> Result<ResolvedPaths> {
     let probe_file = data_dir.join(".write-test");
     fs::write(&probe_file, b"ok")?;
     fs::remove_file(&probe_file)?;
-
-    Ok(ResolvedPaths { logs_dir, db_path })
+    Ok(ResolvedPaths {
+        logs_dir,
+        data_dir: data_dir.clone(),
+        db_path,
+    })
 }
 
 fn ensure_dir(path: &str) -> Result<PathBuf> {

@@ -1,8 +1,8 @@
 use std::env;
 
 use super::env::{
-    AppConfig, CerebrasConfig, ConfigError, DirectoryConfig, LoggingConfig, SchedulerConfig,
-    WebContentConfig,
+    AppConfig, CerebrasConfig, ConfigError, DirectoryConfig, LoggingConfig, ResilienceConfig,
+    SchedulerConfig, UpdateConfig, WebContentConfig,
 };
 
 pub fn load_config() -> Result<AppConfig, ConfigError> {
@@ -73,6 +73,35 @@ impl AppConfig {
                 .unwrap_or(1_000),
         };
 
+        let resilience = ResilienceConfig {
+            network_error_threshold: env::var("NETWORK_ERROR_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(5),
+            network_error_window: std::time::Duration::from_secs(
+                env::var("NETWORK_ERROR_WINDOW_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(60),
+            ),
+            restart_cooldown: std::time::Duration::from_secs(
+                env::var("EMERGENCY_RESTART_COOLDOWN_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(600),
+            ),
+        };
+
+        let update = UpdateConfig {
+            enabled: parse_bool_env("AUTO_UPDATE_ENABLED").unwrap_or(false),
+            check_on_startup: parse_bool_env("AUTO_UPDATE_CHECK_ON_STARTUP").unwrap_or(true),
+            auto_restart: parse_bool_env("AUTO_UPDATE_AUTO_RESTART").unwrap_or(true),
+            repo_owner: env::var("AUTO_UPDATE_REPO_OWNER")
+                .unwrap_or_else(|_| "yldst-dev".to_string()),
+            repo_name: env::var("AUTO_UPDATE_REPO_NAME")
+                .unwrap_or_else(|_| "fuckyou-spam-rs".to_string()),
+        };
+
         Ok(Self {
             telegram_bot_token,
             bot_username,
@@ -85,6 +114,8 @@ impl AppConfig {
             timezone,
             scheduler,
             web,
+            resilience,
+            update,
         })
     }
 }
@@ -93,4 +124,14 @@ fn parse_int(key: &str) -> Option<i64> {
     env::var(key)
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
+}
+
+fn parse_bool_env(key: &str) -> Option<bool> {
+    env::var(key)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
 }
