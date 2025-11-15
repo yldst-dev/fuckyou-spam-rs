@@ -1,12 +1,14 @@
 use std::{
     env,
-    ffi::CString,
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process, thread,
     time::{Duration, Instant},
 };
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::ffi::CString;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -47,6 +49,7 @@ impl InstanceGuard {
         loop {
             let mut file = OpenOptions::new()
                 .create(true)
+                .truncate(true)
                 .read(true)
                 .write(true)
                 .open(&lock_path)
@@ -219,16 +222,14 @@ fn terminate_conflicting_instances() -> Result<()> {
         if pid_u32 == current_pid {
             continue;
         }
-        if matches_signature(proc_info, current_exe.as_deref()) {
-            if terminate_process(pid_u32)? {
-                killed_any = true;
-                tracing::warn!(
-                    target: "lifecycle",
-                    pid = pid_u32,
-                    name = proc_info.name(),
-                    "terminated conflicting bot instance"
-                );
-            }
+        if matches_signature(proc_info, current_exe.as_deref()) && terminate_process(pid_u32)? {
+            killed_any = true;
+            tracing::warn!(
+                target: "lifecycle",
+                pid = pid_u32,
+                name = proc_info.name(),
+                "terminated conflicting bot instance"
+            );
         }
     }
 
