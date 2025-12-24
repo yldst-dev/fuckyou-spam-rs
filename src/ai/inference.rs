@@ -27,6 +27,7 @@ Return a JSON object mapping message IDs (strings) to classification objects usi
   }
 }
 - Always include both fields. When spam is true, reason MUST be a short Korean sentence (<80 chars) that cites the specific spam signal (e.g., "실시간 종목타점 채널 홍보 링크"). When spam is false, set reason to null.
+- When spam is true, reason is MANDATORY and must be a non-empty Korean sentence (<80 chars) explaining the exact spam signal. If you cannot determine a signal, set reason to "모델이 사유를 제공하지 않았습니다." Do NOT leave reason blank or null when spam is true.
 - Never invent message IDs or return extra keys.
 
 Example classification for the message

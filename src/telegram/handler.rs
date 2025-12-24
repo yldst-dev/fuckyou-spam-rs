@@ -7,7 +7,7 @@ use teloxide::{
     dispatching::Dispatcher,
     error_handlers::ErrorHandler,
     prelude::*,
-    types::{BotCommandScope, ChatId, Message, Recipient},
+    types::{BotCommandScope, CallbackQuery, ChatId, Message, Recipient, UserId},
     update_listeners,
     utils::command::BotCommands,
 };
@@ -252,13 +252,19 @@ impl TelegramService {
             "Telegram 봇 연결 완료"
         );
 
-        let handler = Update::filter_message()
+        let message_handler = Update::filter_message()
             .branch(
                 dptree::entry()
                     .filter_command::<GeneralCommand>()
                     .endpoint(Self::on_command),
             )
             .branch(dptree::endpoint(Self::on_plain_message));
+
+        let callback_handler = Update::filter_callback_query().endpoint(Self::on_callback_query);
+
+        let handler = dptree::entry()
+            .branch(message_handler)
+            .branch(callback_handler);
 
         let mut dispatcher = Dispatcher::builder(self.bot.clone(), handler)
             .dependencies(dptree::deps![self.state.clone()])
@@ -547,6 +553,95 @@ impl TelegramService {
                 .await?;
             }
         }
+        Ok(())
+    }
+
+    async fn on_callback_query(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> BotResult<()> {
+        let Some(data) = q.data.as_deref() else {
+            return Ok(());
+        };
+
+        // Only handle ban actions from the admin group
+        let Some(message) = q.message else {
+            return Ok(());
+        };
+        let chat = message.chat();
+        if !state.is_admin_group(chat.id.0) {
+            return Ok(());
+        }
+
+        if !state.is_admin_user(user_to_i64(&q.from)) {
+            bot.answer_callback_query(q.id)
+                .text("관리자만 실행할 수 있습니다.")
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
+
+        if !data.starts_with("ban:") {
+            return Ok(());
+        }
+
+        let parts: Vec<&str> = data.split(':').collect();
+        if parts.len() != 3 {
+            bot.answer_callback_query(q.id)
+                .text("잘못된 요청입니다.")
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
+
+        let chat_id: i64 = match parts[1].parse() {
+            Ok(id) => id,
+            Err(_) => {
+                bot.answer_callback_query(q.id)
+                    .text("chat_id 파싱 실패")
+                    .show_alert(true)
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        let user_id_raw: i64 = match parts[2].parse() {
+            Ok(id) => id,
+            Err(_) => {
+                bot.answer_callback_query(q.id)
+                    .text("user_id 파싱 실패")
+                    .show_alert(true)
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        if user_id_raw < 0 {
+            bot.answer_callback_query(q.id)
+                .text("user_id 형식이 올바르지 않습니다.")
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
+
+        let target_user = UserId(user_id_raw as u64);
+
+        match bot.ban_chat_member(ChatId(chat_id), target_user).await {
+            Ok(_) => {
+                bot.answer_callback_query(q.id).text("밴 완료").await?;
+            }
+            Err(err) => {
+                tracing::error!(
+                    target: "telegram",
+                    error = %err,
+                    chat_id,
+                    user_id = user_id_raw,
+                    "failed to ban user via callback"
+                );
+                bot.answer_callback_query(q.id)
+                    .text("밴 실패: 권한 또는 네트워크 오류")
+                    .show_alert(true)
+                    .await?;
+            }
+        }
+
         Ok(())
     }
 

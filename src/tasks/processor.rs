@@ -15,6 +15,8 @@ use crate::{
     web_content::WebContentFetcher,
 };
 
+const DEFAULT_REASON: &str = "모델이 사유를 제공하지 않았습니다.";
+
 pub struct MessageProcessor {
     queue: Arc<MessageQueue<MessageJob>>,
     bot: Bot,
@@ -158,7 +160,11 @@ impl MessageProcessor {
                 continue;
             }
             if let Some(job) = lookup.remove(&message_id) {
-                let reason_text = reason.as_deref();
+                let reason_text = reason
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(DEFAULT_REASON);
                 if let Err(err) = self.delete_spam(&job, reason_text).await {
                     tracing::error!(
                         target: "processor",
@@ -173,7 +179,7 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn delete_spam(&self, job: &MessageJob, reason: Option<&str>) -> Result<()> {
+    async fn delete_spam(&self, job: &MessageJob, reason: &str) -> Result<()> {
         self.bot
             .delete_message(job.chat_id, job.message_id)
             .await
@@ -190,13 +196,23 @@ impl MessageProcessor {
         if let Some(admin_group_id) = self.config.admin_group_id {
             if admin_group_id != 0 {
                 let deleted_at = Utc::now();
-                let formatted = self.format_admin_log(job, deleted_at, reason);
-                if let Err(err) = self
+                let formatted = self.format_admin_log(job, deleted_at, Some(reason));
+                let mut request = self
                     .bot
                     .send_message(ChatId(admin_group_id), formatted)
-                    .parse_mode(ParseMode::Html)
-                    .await
-                {
+                    .parse_mode(ParseMode::Html);
+
+                if let Some(user_id) = job.from_id {
+                    let markup = teloxide::types::InlineKeyboardMarkup::new(vec![vec![
+                        teloxide::types::InlineKeyboardButton::callback(
+                            "유저 밴",
+                            format!("ban:{}:{}", job.chat_id.0, user_id),
+                        ),
+                    ]]);
+                    request = request.reply_markup(markup);
+                }
+
+                if let Err(err) = request.await {
                     tracing::error!(
                         target: "processor",
                         error = %err,
@@ -246,7 +262,7 @@ impl MessageProcessor {
             sent_time.format("%Y-%m-%d %H:%M:%S"),
             deleted_time.format("%Y-%m-%d %H:%M:%S"),
             escape_html(&job.text),
-            escape_html(reason.unwrap_or("모델이 사유를 제공하지 않았습니다."))
+            escape_html(reason.unwrap_or(DEFAULT_REASON))
         )
     }
 }

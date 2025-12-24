@@ -4,7 +4,7 @@ FROM rust:1.75-slim as builder
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
-    libssl-dev \
+    libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -29,7 +29,7 @@ FROM debian:bullseye-slim
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    sqlite3 \
+    libsqlite3-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Create app user
@@ -47,13 +47,6 @@ RUN mkdir -p data logs && \
 
 # Switch to non-root user
 USER botuser
-
-# Expose health check port
-EXPOSE 3000
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
 
 # Run the application
 CMD ["./fuckyou-spam-rust"]
