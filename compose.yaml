@@ -8,7 +8,7 @@ services:
     command: >
       uid=${HOST_UID:-$(id -u botuser)}; gid=${HOST_GID:-$(id -g botuser)};
       mkdir -p /app/data /app/logs;
-      chown -R $uid:$gid /app/data /app/logs
+      chown -R $$uid:$$gid /app/data /app/logs
     environment:
       - HOST_UID
       - HOST_GID
