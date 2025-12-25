@@ -21,6 +21,7 @@ services:
     depends_on:
       init-perms:
         condition: service_completed_successfully
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     build:
       context: .
     image: fuckyou-spam-rust:local
