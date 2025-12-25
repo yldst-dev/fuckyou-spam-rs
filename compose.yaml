@@ -1,12 +1,30 @@
 services:
+  init-perms:
+    build:
+      context: .
+    image: fuckyou-spam-rust:local
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      uid=$(id -u botuser); gid=$(id -g botuser);
+      mkdir -p /app/data /app/logs;
+      chown -R $uid:$gid /app/data /app/logs
+    volumes:
+      - ./data:/app/data:Z
+      - ./logs:/app/logs:Z
+    restart: "no"
+
   spam-bot:
+    depends_on:
+      init-perms:
+        condition: service_completed_successfully
     build:
       context: .
     image: fuckyou-spam-rust:local
     env_file:
       - .env
     volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
+      - ./data:/app/data:Z
+      - ./logs:/app/logs:Z
     restart: unless-stopped
     stop_grace_period: 30s
