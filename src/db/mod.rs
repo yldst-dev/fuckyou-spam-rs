@@ -1,10 +1,8 @@
 use std::{path::Path, str::FromStr, time::Duration};
 
 use anyhow::Result;
-use sqlx::{
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
-    SqlitePool,
-};
+use sqlx_core::query::query;
+use sqlx_sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 
 pub mod whitelist;
 
@@ -19,7 +17,7 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool> {
         .connect_with(options)
         .await?;
 
-    sqlx::query(
+    query(
         r#"
         CREATE TABLE IF NOT EXISTS whitelist (
             chat_id INTEGER PRIMARY KEY,

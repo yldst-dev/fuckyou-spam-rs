@@ -23,8 +23,9 @@ reqwest = { version = "0.12.9", default-features = false, features = ["json", "s
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "signal", "time", "fs"] }
 tokio-cron-scheduler = "0.10.0"
 teloxide = { version = "0.17.0", features = ["macros", "ctrlc_handler"] }
-sqlx = { version = "0.8.3", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "chrono"] }
-dom_smoothie = "0.13"
+sqlx-core = { version = "0.8.6", default-features = false, features = ["_rt-tokio"] }
+sqlx-sqlite = { version = "0.8.6", default-features = false, features = ["chrono", "bundled"] }
+dom_smoothie = "0.14"
 semver = "1.0"
 flate2 = "1.0"
 tar = "0.4"
