@@ -6,9 +6,12 @@ services:
     user: "0:0"
     entrypoint: ["/bin/sh", "-c"]
     command: >
-      uid=$(id -u botuser); gid=$(id -g botuser);
+      uid=${HOST_UID:-$(id -u botuser)}; gid=${HOST_GID:-$(id -g botuser)};
       mkdir -p /app/data /app/logs;
       chown -R $uid:$gid /app/data /app/logs
+    environment:
+      - HOST_UID
+      - HOST_GID
     volumes:
       - ./data:/app/data:Z
       - ./logs:/app/logs:Z
