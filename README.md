@@ -60,6 +60,11 @@ AUTO_UPDATE_CHECK_ON_STARTUP=true
 AUTO_UPDATE_AUTO_RESTART=true
 AUTO_UPDATE_REPO_OWNER=yldst-dev
 AUTO_UPDATE_REPO_NAME=fuckyou-spam-rs
+AUTO_UPDATE_ALLOWED_REPO_OWNERS=yldst-dev
+AUTO_UPDATE_ALLOWED_REPO_NAMES=fuckyou-spam-rs
+AUTO_UPDATE_ASSET_HOST_ALLOWLIST=github.com,objects.githubusercontent.com,github-releases.githubusercontent.com
+AUTO_UPDATE_MAX_DOWNLOAD_BYTES=52428800
+AUTO_UPDATE_ASSET_SHA256=
 ```
 
 #### 3. Build and Run
@@ -72,6 +77,35 @@ docker compose up -d --build
 docker compose logs -f
 docker compose down
 ```
+
+Persistent data (`whitelist.db`, spam cache, runtime lock) and log files live in the named
+volumes `bot-data` and `bot-logs`. They survive `docker compose down` and are only removed with
+`docker compose down -v`. The container runs read-only, as a non-root user, with all Linux
+capabilities dropped and `no-new-privileges`; the named volumes are initialized with the
+container user's ownership on first start, so no host-side permission setup is required.
+
+### Option 1b: Dokploy (Compose)
+
+The bot runs as a **Compose** service in [Dokploy](https://dokploy.com/). No code changes are
+needed — `compose.yaml` is already Dokploy-compatible (named volumes, no host bind mounts, no
+`HOST_UID` handling).
+
+1. **Create service**: In your Dokploy project, add a new service of type **Compose** and point
+   it at this Git repository. Set the Compose Path to `compose.yaml`.
+2. **Environment**: Open the service **Environment** tab and paste the contents of `.env.example`,
+   filling in the real `TELEGRAM_BOT_TOKEN`, `CEREBRAS_API_KEY`, `BOT_USERNAME`, and admin IDs.
+   Dokploy writes these to the `.env` file that `compose.yaml` reads via `env_file`.
+3. **Deploy**: Click **Deploy**. Dokploy builds the image from the `Dockerfile` and starts the
+   `spam-bot` service. The `bot-data` / `bot-logs` volumes persist across redeploys.
+4. **Updates**: Push to the tracked branch and redeploy from Dokploy. Keep
+   `AUTO_UPDATE_ENABLED=false` — in-container self-updates are blocked by the read-only root
+   filesystem, and updates should go through a rebuild/redeploy instead.
+
+Notes:
+- There is no exposed port. This is a Telegram long-polling bot, so no domain/Traefik route is
+  required. Leave the ports/domains section empty.
+- Application logs are visible in Dokploy; the app also writes rotating files into the `bot-logs`
+  volume.
 
 ### Option 2: Build from Source
 
@@ -95,7 +129,12 @@ Copy `.env.example` to `.env` and configure (same as Docker Compose).
 > `data/updates/`, swapped into the current install directory, and optionally re-exec'd immediately
 > when `AUTO_UPDATE_AUTO_RESTART=true`. If `ADMIN_GROUP_ID` is set, the bot sends a status message
 > (old/new versions + restart plan) to that group after the binary swap. Disable the flag when
-> running from `cargo run` or inside container builds where self-updates are undesired.
+> running from `cargo run` or inside container builds where self-updates are undesired. The updater
+> only accepts configured repository owner/name values that also appear in the allowlists, only
+> downloads release assets from exact HTTPS hosts in `AUTO_UPDATE_ASSET_HOST_ALLOWLIST`, rejects
+> assets larger than `AUTO_UPDATE_MAX_DOWNLOAD_BYTES`, and verifies SHA-256 before unpacking. Set
+> `AUTO_UPDATE_ASSET_SHA256` to pin a specific asset hash, or leave it empty and publish a
+> `<asset>.sha256` release asset next to each binary archive.
 
 ### 4. Run the Bot
 
@@ -210,8 +249,25 @@ src/
 | `LOG_LEVEL` | No | info | Logging level (trace, debug, info, warn, error) |
 | `WEBPAGE_FETCH_TIMEOUT` | No | 10000 | Timeout for URL analysis (ms) |
 | `MAX_URLS_PER_MESSAGE` | No | 2 | Max URLs to analyze per message |
+| `WEBPAGE_RESPONSE_MAX_BYTES` | No | 1048576 | Maximum external webpage response bytes to read |
+| `QUEUE_MAX_MESSAGES` | No | 5000 | Maximum queued messages across priorities |
+| `QUEUE_HIGH_PRIORITY_MAX` | No | 1000 | Maximum high-priority queued messages |
+| `QUEUE_NORMAL_PRIORITY_MAX` | No | 4000 | Maximum normal-priority queued messages |
+| `SPAM_CACHE_SIMILARITY_THRESHOLD` | No | 0.92 | Similarity threshold for deleting previously seen spam without LLM |
+| `SPAM_CACHE_SCAN_LIMIT` | No | 1000 | Recent spam cache rows to compare for similarity |
+| `SPAM_CACHE_MIN_NORMALIZED_CHARS` | No | 8 | Minimum normalized message length for spam cache matching |
 | `RESTART_SCHEDULE` | No | 0 2 * * * | Cron schedule for restarts |
 | `TIMEZONE` | No | Asia/Seoul | Timezone for logging |
+| `AUTO_UPDATE_ENABLED` | No | false | Enable startup auto-update |
+| `AUTO_UPDATE_CHECK_ON_STARTUP` | No | true | Check latest release on process startup |
+| `AUTO_UPDATE_AUTO_RESTART` | No | true | Re-exec after installing a new binary |
+| `AUTO_UPDATE_REPO_OWNER` | No | yldst-dev | GitHub release repository owner |
+| `AUTO_UPDATE_REPO_NAME` | No | fuckyou-spam-rs | GitHub release repository name |
+| `AUTO_UPDATE_ALLOWED_REPO_OWNERS` | No | yldst-dev | Comma-separated allowed release repository owners |
+| `AUTO_UPDATE_ALLOWED_REPO_NAMES` | No | fuckyou-spam-rs | Comma-separated allowed release repository names |
+| `AUTO_UPDATE_ASSET_HOST_ALLOWLIST` | No | github.com,objects.githubusercontent.com,github-releases.githubusercontent.com | Comma-separated exact HTTPS hosts allowed for release asset downloads |
+| `AUTO_UPDATE_MAX_DOWNLOAD_BYTES` | No | 52428800 | Maximum release asset download size in bytes |
+| `AUTO_UPDATE_ASSET_SHA256` | No | - | Optional pinned SHA-256 for the selected asset; otherwise `<asset>.sha256` release asset is required |
 
 ### Database Schema
 

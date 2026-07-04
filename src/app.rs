@@ -14,7 +14,7 @@ use tokio_cron_scheduler::JobScheduler;
 use crate::{
     ai::CerebrasClient,
     config::AppConfig,
-    db::{self, whitelist::WhitelistRepository},
+    db::{self, spam_cache::SpamCacheRepository, whitelist::WhitelistRepository},
     domain::{MessageJob, QueueSnapshot},
     infrastructure::{
         directories::ResolvedPaths, notifier::notify_admin_group, shutdown::Shutdown,
@@ -47,7 +47,8 @@ impl SpamGuardApp {
     ) -> Result<Self> {
         let config = Arc::new(config);
         let pool = db::init_pool(&paths.db_path).await?;
-        let whitelist = Arc::new(WhitelistRepository::new(pool));
+        let whitelist = Arc::new(WhitelistRepository::new(pool.clone()));
+        let spam_cache = Arc::new(SpamCacheRepository::new(pool));
 
         let http_client = Client::builder()
             .user_agent(format!("fuckyou-spam-rust/{}", env!("CARGO_PKG_VERSION")))
@@ -60,7 +61,7 @@ impl SpamGuardApp {
         let web_fetcher = Arc::new(WebContentFetcher::new(http_client, config.web.clone())?);
 
         let bot = Bot::new(&config.telegram_bot_token);
-        let queue = Arc::new(MessageQueue::<MessageJob>::new());
+        let queue = Arc::new(MessageQueue::<MessageJob>::new(config.queue.clone()));
         let queue_snapshot_provider: Arc<dyn Fn() -> QueueSnapshot + Send + Sync> = {
             let queue = queue.clone();
             Arc::new(move || queue.snapshot())
@@ -82,6 +83,7 @@ impl SpamGuardApp {
             bot.clone(),
             cerebras,
             web_fetcher,
+            spam_cache,
             config.clone(),
         ));
         let processor_handle = processor.clone().spawn(shutdown.subscribe());
@@ -171,14 +173,6 @@ impl SpamGuardApp {
             }
         }
 
-        if timeout(shutdown_timeout, whitelist.close()).await.is_err() {
-            tracing::warn!(
-                target: "db",
-                "화이트리스트 리소스 정리가 {:?} 내에 완료되지 않았습니다.",
-                shutdown_timeout
-            );
-        }
-
         let processor_sleep = tokio::time::sleep(shutdown_timeout);
         tokio::pin!(processor_sleep);
         tokio::select! {
@@ -197,6 +191,14 @@ impl SpamGuardApp {
                 );
                 processor_handle.abort();
             }
+        }
+
+        if timeout(shutdown_timeout, whitelist.close()).await.is_err() {
+            tracing::warn!(
+                target: "db",
+                "화이트리스트 리소스 정리가 {:?} 내에 완료되지 않았습니다.",
+                shutdown_timeout
+            );
         }
 
         tracing::info!("봇 종료 완료");

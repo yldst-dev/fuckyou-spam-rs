@@ -25,7 +25,6 @@ impl CerebrasClient {
 
         let request = build_request(self.config.model.clone(), prompt);
 
-        // Log request details for debugging
         tracing::debug!(
             model = %self.config.model,
             prompt_len = %prompt.len(),
@@ -40,16 +39,13 @@ impl CerebrasClient {
             .send()
             .await?;
 
-        // Check status and log error details
         if let Err(err) = http_response.error_for_status_ref() {
             let status = http_response.status();
-            let error_text = http_response.text().await.unwrap_or_default();
             tracing::error!(
                 status = %status,
-                error_body = %error_text,
                 "Cerebras API request failed"
             );
-            return Err(err).context(format!("Cerebras API error {}: {}", status, error_text));
+            return Err(err).context(format!("Cerebras API error {}", status));
         }
 
         let response = http_response;

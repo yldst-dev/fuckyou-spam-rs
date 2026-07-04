@@ -1,34 +1,29 @@
 services:
-  init-perms:
-    build:
-      context: .
-    image: fuckyou-spam-rust:local
-    user: "0:0"
-    entrypoint: ["/bin/sh", "-c"]
-    command: >
-      uid=${HOST_UID:-$(id -u botuser)}; gid=${HOST_GID:-$(id -g botuser)};
-      mkdir -p /app/data /app/logs;
-      chown -R $$uid:$$gid /app/data /app/logs
-    environment:
-      - HOST_UID
-      - HOST_GID
-    volumes:
-      - ./data:/app/data:Z
-      - ./logs:/app/logs:Z
-    restart: "no"
-
   spam-bot:
-    depends_on:
-      init-perms:
-        condition: service_completed_successfully
-    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     build:
       context: .
-    image: fuckyou-spam-rust:local
-    env_file:
-      - .env
-    volumes:
-      - ./data:/app/data:Z
-      - ./logs:/app/logs:Z
+    image: fuckyou-spam-rust:latest
     restart: unless-stopped
     stop_grace_period: 30s
+    init: true
+    env_file:
+      - .env
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    volumes:
+      - bot-data:/app/data
+      - bot-logs:/app/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bot-data:
+  bot-logs:

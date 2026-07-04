@@ -9,19 +9,24 @@ use tokio::{task::JoinHandle, time::sleep};
 use crate::{
     ai::CerebrasClient,
     config::AppConfig,
-    domain::{ClassificationDecision, ClassificationMap, MessageJob, WebContent},
+    db::spam_cache::{SpamCacheHit, SpamCacheRepository},
+    domain::{
+        ClassificationDecision, ClassificationMap, MessageFingerprint, MessageJob, WebContent,
+    },
     infrastructure::shutdown::ShutdownListener,
     tasks::queue::MessageQueue,
     web_content::WebContentFetcher,
 };
 
 const DEFAULT_REASON: &str = "모델이 사유를 제공하지 않았습니다.";
+const MAX_REASON_CHARS: usize = 80;
 
 pub struct MessageProcessor {
     queue: Arc<MessageQueue<MessageJob>>,
     bot: Bot,
     cerebras: Arc<CerebrasClient>,
     web_fetcher: Arc<WebContentFetcher>,
+    spam_cache: Arc<SpamCacheRepository>,
     config: Arc<AppConfig>,
 }
 
@@ -31,6 +36,7 @@ impl MessageProcessor {
         bot: Bot,
         cerebras: Arc<CerebrasClient>,
         web_fetcher: Arc<WebContentFetcher>,
+        spam_cache: Arc<SpamCacheRepository>,
         config: Arc<AppConfig>,
     ) -> Self {
         Self {
@@ -38,6 +44,7 @@ impl MessageProcessor {
             bot,
             cerebras,
             web_fetcher,
+            spam_cache,
             config,
         }
     }
@@ -80,6 +87,7 @@ impl MessageProcessor {
         tracing::info!(target: "processor", total = batch.len(), "processing batch");
         let mut prompt_entries = Vec::with_capacity(batch.len());
         let mut lookup: HashMap<String, MessageJob> = HashMap::new();
+        let mut fingerprints: HashMap<String, MessageFingerprint> = HashMap::new();
 
         for job in batch {
             if shutdown.is_triggered() {
@@ -88,6 +96,48 @@ impl MessageProcessor {
                     "shutdown requested while assembling batch; aborting early"
                 );
                 return Ok(());
+            }
+
+            let fingerprint = MessageFingerprint::from_text(
+                &job.text,
+                self.config.spam_cache.min_normalized_chars,
+            );
+
+            if let Some(fingerprint) = &fingerprint {
+                if let Some(hit) = self.find_cached_spam(fingerprint).await {
+                    let reason = cached_reason(&hit);
+                    match self.delete_spam(&job, &reason).await {
+                        Ok(()) => {
+                            if let Err(err) = self.spam_cache.mark_hit(hit.id).await {
+                                tracing::warn!(
+                                    target: "processor",
+                                    error = %err,
+                                    cache_id = hit.id,
+                                    "failed to mark spam cache hit"
+                                );
+                            }
+                            tracing::info!(
+                                target: "processor",
+                                chat_id = job.chat_id.0,
+                                message_id = job.message_id.0,
+                                cache_id = hit.id,
+                                similarity = hit.score,
+                                "spam message deleted from cache match"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                target: "processor",
+                                error = %err,
+                                chat_id = job.chat_id.0,
+                                message_id = job.message_id.0,
+                                cache_id = hit.id,
+                                "failed to delete cached spam"
+                            );
+                        }
+                    }
+                    continue;
+                }
             }
 
             let member_flag = if job.is_group_member {
@@ -127,7 +177,11 @@ impl MessageProcessor {
                 }
             }
 
-            lookup.insert(job.message_id.0.to_string(), job);
+            let message_id = job.message_id.0.to_string();
+            if let Some(fingerprint) = fingerprint {
+                fingerprints.insert(message_id.clone(), fingerprint);
+            }
+            lookup.insert(message_id, job);
             prompt_entries.push(entry);
         }
 
@@ -147,25 +201,62 @@ impl MessageProcessor {
             }
         }?;
 
-        self.apply_classification(classification, lookup).await
+        self.apply_classification(classification, lookup, fingerprints)
+            .await
+    }
+
+    async fn find_cached_spam(&self, fingerprint: &MessageFingerprint) -> Option<SpamCacheHit> {
+        match self
+            .spam_cache
+            .find_match(
+                fingerprint,
+                self.config.spam_cache.similarity_threshold,
+                self.config.spam_cache.scan_limit,
+            )
+            .await
+        {
+            Ok(hit) => hit,
+            Err(err) => {
+                tracing::warn!(
+                    target: "processor",
+                    error = %err,
+                    "failed to query spam cache"
+                );
+                None
+            }
+        }
     }
 
     async fn apply_classification(
         &self,
         classification: ClassificationMap,
         mut lookup: HashMap<String, MessageJob>,
+        mut fingerprints: HashMap<String, MessageFingerprint>,
     ) -> Result<()> {
         for (message_id, ClassificationDecision { spam, reason }) in classification {
+            if message_id.parse::<i32>().is_err() {
+                tracing::warn!(
+                    target: "processor",
+                    returned_message_id = %message_id,
+                    "ignored classification with malformed message_id"
+                );
+                continue;
+            }
+            if !lookup.contains_key(&message_id) {
+                tracing::warn!(
+                    target: "processor",
+                    returned_message_id = %message_id,
+                    batch_size = lookup.len(),
+                    "ignored classification for message_id outside current batch"
+                );
+                continue;
+            }
             if !spam {
                 continue;
             }
             if let Some(job) = lookup.remove(&message_id) {
-                let reason_text = reason
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(DEFAULT_REASON);
-                if let Err(err) = self.delete_spam(&job, reason_text).await {
+                let reason_text = sanitize_reason(reason.as_deref());
+                if let Err(err) = self.delete_spam(&job, &reason_text).await {
                     tracing::error!(
                         target: "processor",
                         error = %err,
@@ -173,6 +264,22 @@ impl MessageProcessor {
                         message_id = job.message_id.0,
                         "failed to delete spam"
                     );
+                    continue;
+                }
+                if let Some(fingerprint) = fingerprints.remove(&message_id) {
+                    if let Err(err) = self
+                        .spam_cache
+                        .record_spam(&job, &fingerprint, &reason_text)
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "processor",
+                            error = %err,
+                            chat_id = job.chat_id.0,
+                            message_id = job.message_id.0,
+                            "failed to record spam cache"
+                        );
+                    }
                 }
             }
         }
@@ -300,4 +407,29 @@ fn escape_html(text: &str) -> String {
         }
     }
     escaped
+}
+
+fn cached_reason(hit: &SpamCacheHit) -> String {
+    let reason = sanitize_reason(hit.reason.as_deref());
+    if hit.score >= 1.0 {
+        reason
+    } else {
+        format!("{reason} 이전 스팸과 유사도 {:.0}%", hit.score * 100.0)
+    }
+}
+
+fn sanitize_reason(reason: Option<&str>) -> String {
+    let Some(reason) = reason else {
+        return DEFAULT_REASON.to_string();
+    };
+    let normalized = reason
+        .trim()
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return DEFAULT_REASON.to_string();
+    }
+    normalized.chars().take(MAX_REASON_CHARS).collect()
 }

@@ -1,47 +1,33 @@
-# Multi-stage build for Rust application
-FROM rust:1.85-slim as builder
+FROM rust:1.85-slim AS builder
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    libsqlite3-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set working directory
 WORKDIR /app
 
-# Copy manifest and sources
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+RUN mkdir -p src \
+    && echo 'fn main() {}' > src/main.rs \
+    && cargo build --release \
+    && rm -rf src target/release/deps/fuckyou_spam_rust* target/release/fuckyou-spam-rust
 
-# Build the application
+COPY src ./src
 RUN cargo build --release
 
-# Runtime stage
 FROM debian:bookworm-slim
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libsqlite3-0 \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Create app user
-RUN groupadd -r botuser && useradd -r -g botuser botuser
+RUN groupadd -r -g 10001 botuser \
+    && useradd -r -u 10001 -g botuser -s /usr/sbin/nologin botuser
 
-# Set working directory
 WORKDIR /app
 
-# Copy binary from builder stage
 COPY --from=builder /app/target/release/fuckyou-spam-rust ./
 
-# Create necessary directories
-RUN mkdir -p data logs && \
-    chown -R botuser:botuser /app
+RUN mkdir -p data logs \
+    && chown -R botuser:botuser /app \
+    && chmod 700 data logs
 
-# Switch to non-root user
 USER botuser
 
-# Run the application
 CMD ["./fuckyou-spam-rust"]

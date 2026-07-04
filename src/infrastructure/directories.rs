@@ -36,7 +36,7 @@ fn ensure_dir(path: &str) -> Result<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(metadata) = fs::metadata(&dir) {
             let mut perms = metadata.permissions();
-            perms.set_mode(0o755);
+            perms.set_mode(0o700);
             let _ = fs::set_permissions(&dir, perms);
         }
     }

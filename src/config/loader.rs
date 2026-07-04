@@ -1,8 +1,8 @@
 use std::env;
 
 use super::env::{
-    AppConfig, CerebrasConfig, ConfigError, DirectoryConfig, LoggingConfig, ResilienceConfig,
-    SchedulerConfig, UpdateConfig, WebContentConfig,
+    AppConfig, CerebrasConfig, ConfigError, DirectoryConfig, LoggingConfig, QueueConfig,
+    ResilienceConfig, SchedulerConfig, SpamCacheConfig, UpdateConfig, WebContentConfig,
 };
 
 pub fn load_config() -> Result<AppConfig, ConfigError> {
@@ -56,21 +56,32 @@ impl AppConfig {
                 .unwrap_or_else(|_| vec!["0 0 0 * * *".to_string(), "0 0 12 * * *".to_string()]),
         };
 
+        let queue = QueueConfig {
+            max_messages: parse_usize_env("QUEUE_MAX_MESSAGES", 5_000),
+            high_priority_max: parse_usize_env("QUEUE_HIGH_PRIORITY_MAX", 1_000),
+            normal_priority_max: parse_usize_env("QUEUE_NORMAL_PRIORITY_MAX", 4_000),
+        };
+
+        let spam_cache = SpamCacheConfig {
+            similarity_threshold: parse_f64_env("SPAM_CACHE_SIMILARITY_THRESHOLD", 0.92)
+                .clamp(0.0, 1.0),
+            scan_limit: parse_i64_env("SPAM_CACHE_SCAN_LIMIT", 1_000).max(1),
+            min_normalized_chars: parse_usize_env("SPAM_CACHE_MIN_NORMALIZED_CHARS", 8),
+        };
+
         let web = WebContentConfig {
-            max_urls_per_message: env::var("MAX_URLS_PER_MESSAGE")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(2),
+            max_urls_per_message: parse_usize_env("MAX_URLS_PER_MESSAGE", 2),
             fetch_timeout: std::time::Duration::from_millis(
                 env::var("WEBPAGE_FETCH_TIMEOUT")
                     .ok()
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(10_000),
             ),
-            content_max_length: env::var("WEBPAGE_CONTENT_MAX_LENGTH")
+            response_max_bytes: env::var("WEBPAGE_RESPONSE_MAX_BYTES")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(1_000),
+                .unwrap_or(1_048_576),
+            content_max_length: parse_usize_env("WEBPAGE_CONTENT_MAX_LENGTH", 1_000),
         };
 
         let resilience = ResilienceConfig {
@@ -100,6 +111,27 @@ impl AppConfig {
                 .unwrap_or_else(|_| "yldst-dev".to_string()),
             repo_name: env::var("AUTO_UPDATE_REPO_NAME")
                 .unwrap_or_else(|_| "fuckyou-spam-rs".to_string()),
+            allowed_repo_owners: parse_csv_env("AUTO_UPDATE_ALLOWED_REPO_OWNERS", &["yldst-dev"]),
+            allowed_repo_names: parse_csv_env(
+                "AUTO_UPDATE_ALLOWED_REPO_NAMES",
+                &["fuckyou-spam-rs"],
+            ),
+            allowed_asset_hosts: parse_csv_env(
+                "AUTO_UPDATE_ASSET_HOST_ALLOWLIST",
+                &[
+                    "github.com",
+                    "objects.githubusercontent.com",
+                    "github-releases.githubusercontent.com",
+                ],
+            ),
+            max_download_bytes: env::var("AUTO_UPDATE_MAX_DOWNLOAD_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(50 * 1024 * 1024),
+            asset_sha256: env::var("AUTO_UPDATE_ASSET_SHA256")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
         };
 
         Ok(Self {
@@ -113,6 +145,8 @@ impl AppConfig {
             logging,
             timezone,
             scheduler,
+            queue,
+            spam_cache,
             web,
             resilience,
             update,
@@ -134,4 +168,42 @@ fn parse_bool_env(key: &str) -> Option<bool> {
             "0" | "false" | "no" | "off" => Some(false),
             _ => None,
         })
+}
+
+fn parse_csv_env(key: &str, default: &[&str]) -> Vec<String> {
+    env::var(key)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| default.iter().map(|value| value.to_string()).collect())
+}
+
+fn parse_usize_env(key: &str, default: usize) -> usize {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_i64_env(key: &str, default: i64) -> i64 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_f64_env(key: &str, default: f64) -> f64 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
 }
