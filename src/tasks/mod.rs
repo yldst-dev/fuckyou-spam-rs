@@ -1,3 +1,2 @@
-pub mod processor;
-pub mod queue;
-pub mod scheduler;
+pub(crate) mod processor;
+pub(crate) mod queue;

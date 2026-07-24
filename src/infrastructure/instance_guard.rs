@@ -20,12 +20,12 @@ const WAIT_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_WAIT: Duration = Duration::from_secs(20);
 
 #[derive(Debug)]
-pub struct InstanceGuard {
+pub(crate) struct InstanceGuard {
     file: File,
 }
 
 impl InstanceGuard {
-    pub fn acquire(paths: &ResolvedPaths) -> Result<Self> {
+    pub(crate) fn acquire(paths: &ResolvedPaths) -> Result<Self> {
         fs::create_dir_all(&paths.data_dir)
             .with_context(|| format!("failed to ensure data dir {}", paths.data_dir.display()))?;
         let lock_path = paths.data_dir.join(LOCK_FILENAME);

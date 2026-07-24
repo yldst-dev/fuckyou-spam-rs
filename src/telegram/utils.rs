@@ -16,7 +16,7 @@ static TELEGRAM_REGEX: Lazy<Regex> = Lazy::new(|| {
         .expect("valid telegram regex")
 });
 
-pub fn extract_urls(text: &str, limit: usize) -> Vec<String> {
+pub(crate) fn extract_urls(text: &str, limit: usize) -> Vec<String> {
     URL_REGEX
         .find_iter(text)
         .map(|m| normalize_url(m.as_str()))
@@ -25,7 +25,7 @@ pub fn extract_urls(text: &str, limit: usize) -> Vec<String> {
         .collect()
 }
 
-pub fn calc_priority(text: &str, is_member: bool) -> (Priority, i32) {
+pub(crate) fn calc_priority(text: &str, is_member: bool) -> (Priority, i32) {
     let mut score = 1;
     if has_telegram_group_link(text) {
         score += 20;
@@ -47,7 +47,7 @@ fn has_telegram_group_link(text: &str) -> bool {
     TELEGRAM_REGEX.is_match(text)
 }
 
-pub fn format_user_display(user: &User) -> String {
+pub(crate) fn format_user_display(user: &User) -> String {
     if let Some(username) = &user.username {
         format!("@{}", username)
     } else {
@@ -65,11 +65,11 @@ pub fn format_user_display(user: &User) -> String {
     }
 }
 
-pub fn user_to_i64(user: &User) -> i64 {
+pub(crate) fn user_to_i64(user: &User) -> i64 {
     i64::try_from(user.id.0).unwrap_or(i64::MAX)
 }
 
-pub fn admin_command_list() -> Vec<BotCommand> {
+pub(crate) fn admin_command_list() -> Vec<BotCommand> {
     let mut commands = GeneralCommand::bot_commands();
     commands.extend(vec![
         BotCommand::new("whitelist_add", "그룹을 화이트리스트에 추가"),

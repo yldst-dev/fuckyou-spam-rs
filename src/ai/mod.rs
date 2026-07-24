@@ -1,4 +1,4 @@
-pub mod client;
-pub mod inference;
+pub(crate) mod client;
+pub(crate) mod inference;
 
-pub use client::CerebrasClient;
+pub(crate) use client::CerebrasClient;

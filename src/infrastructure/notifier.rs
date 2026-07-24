@@ -2,7 +2,7 @@ use teloxide::{prelude::*, types::ParseMode};
 
 use crate::config::AppConfig;
 
-pub async fn notify_admin_group(bot: &Bot, config: &AppConfig, text: &str) {
+pub(crate) async fn notify_admin_group(bot: &Bot, config: &AppConfig, text: &str) {
     if let Some(admin_group_id) = config.admin_group_id {
         if admin_group_id == 0 {
             return;

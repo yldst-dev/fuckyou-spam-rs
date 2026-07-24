@@ -1,5 +1,7 @@
 mod handler;
-pub mod types;
-pub mod utils;
+mod moderation;
+pub(crate) mod types;
+pub(crate) mod utils;
 
-pub use handler::TelegramService;
+pub(crate) use handler::TelegramService;
+pub(crate) use moderation::TelegramMessageModerationGateway;

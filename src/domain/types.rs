@@ -6,29 +6,29 @@ use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WebContent {
+pub(crate) struct WebContent {
     pub title: Option<String>,
     pub site_name: Option<String>,
     pub content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClassificationDecision {
+pub(crate) struct ClassificationDecision {
     pub spam: bool,
     #[serde(default)]
     pub reason: Option<String>,
 }
 
-pub type ClassificationMap = HashMap<String, ClassificationDecision>;
+pub(crate) type ClassificationMap = HashMap<String, ClassificationDecision>;
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct QueueSnapshot {
+pub(crate) struct QueueSnapshot {
     pub high_priority: usize,
     pub normal_priority: usize,
 }
 
 #[derive(Debug, Clone)]
-pub struct MessageFingerprint {
+pub(crate) struct MessageFingerprint {
     pub text_hash: String,
     pub chat_scope_hash: String,
     pub similarity_hash: i64,
@@ -36,11 +36,11 @@ pub struct MessageFingerprint {
 
 impl MessageFingerprint {
     #[cfg(test)]
-    pub fn from_text(chat_id: i64, text: &str, min_chars: usize) -> Option<Self> {
+    pub(crate) fn from_text(chat_id: i64, text: &str, min_chars: usize) -> Option<Self> {
         Self::from_message(chat_id, text, &[], false, min_chars)
     }
 
-    pub fn from_message(
+    pub(crate) fn from_message(
         chat_id: i64,
         text: &str,
         urls: &[String],
@@ -86,7 +86,7 @@ impl MessageFingerprint {
         })
     }
 
-    pub fn evidence_source_hash(chat_id: i64, source_id: Option<i64>) -> Option<String> {
+    pub(crate) fn evidence_source_hash(chat_id: i64, source_id: Option<i64>) -> Option<String> {
         let source_id = source_id?;
         Some(digest_hex(&[
             b"evidence-source-v1\n",

@@ -1,24 +1,24 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
-use serde::Serialize;
 use sqlx_core::{from_row::FromRow, query::query, query_as::query_as, row::Row};
 use sqlx_sqlite::{SqlitePool, SqliteRow};
 
+use crate::application::ports::{WhitelistEntry, WhitelistGateway, WhitelistRow};
+
 #[derive(Clone)]
-pub struct WhitelistRepository {
+pub(crate) struct WhitelistRepository {
     pool: SqlitePool,
 }
 
 impl WhitelistRepository {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 
-    pub async fn close(&self) {
+    pub(crate) async fn close(&self) {
         self.pool.close().await;
     }
 
-    pub async fn add(&self, entry: WhitelistEntry) -> Result<bool> {
+    pub(crate) async fn add(&self, entry: WhitelistEntry) -> Result<bool> {
         let affected = query(
             r#"INSERT INTO whitelist (chat_id, chat_title, chat_type, added_by)
                 VALUES (?1, ?2, ?3, ?4)
@@ -34,7 +34,7 @@ impl WhitelistRepository {
         Ok(affected > 0)
     }
 
-    pub async fn remove(&self, chat_id: i64) -> Result<bool> {
+    pub(crate) async fn remove(&self, chat_id: i64) -> Result<bool> {
         let affected = query(r#"DELETE FROM whitelist WHERE chat_id = ?1"#)
             .bind(chat_id)
             .execute(&self.pool)
@@ -43,7 +43,7 @@ impl WhitelistRepository {
         Ok(affected > 0)
     }
 
-    pub async fn is_allowed(&self, chat_id: i64) -> Result<bool> {
+    pub(crate) async fn is_allowed(&self, chat_id: i64) -> Result<bool> {
         let result: Option<(i64,)> =
             query_as(r#"SELECT chat_id FROM whitelist WHERE chat_id = ?1"#)
                 .bind(chat_id)
@@ -52,7 +52,7 @@ impl WhitelistRepository {
         Ok(result.is_some())
     }
 
-    pub async fn list(&self) -> Result<Vec<WhitelistRow>> {
+    pub(crate) async fn list(&self) -> Result<Vec<WhitelistRow>> {
         let rows = query_as::<_, WhitelistRow>(
             r#"SELECT chat_id, chat_title, chat_type, added_at, added_by FROM whitelist ORDER BY added_at DESC"#,
         )
@@ -62,21 +62,22 @@ impl WhitelistRepository {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct WhitelistEntry {
-    pub chat_id: i64,
-    pub chat_title: Option<String>,
-    pub chat_type: Option<String>,
-    pub added_by: Option<i64>,
-}
+impl WhitelistGateway for WhitelistRepository {
+    fn add(&self, entry: WhitelistEntry) -> futures::future::BoxFuture<'_, Result<bool>> {
+        Box::pin(WhitelistRepository::add(self, entry))
+    }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct WhitelistRow {
-    pub chat_id: i64,
-    pub chat_title: Option<String>,
-    pub chat_type: Option<String>,
-    pub added_at: DateTime<Utc>,
-    pub added_by: Option<i64>,
+    fn remove(&self, chat_id: i64) -> futures::future::BoxFuture<'_, Result<bool>> {
+        Box::pin(WhitelistRepository::remove(self, chat_id))
+    }
+
+    fn is_allowed(&self, chat_id: i64) -> futures::future::BoxFuture<'_, Result<bool>> {
+        Box::pin(WhitelistRepository::is_allowed(self, chat_id))
+    }
+
+    fn list(&self) -> futures::future::BoxFuture<'_, Result<Vec<WhitelistRow>>> {
+        Box::pin(WhitelistRepository::list(self))
+    }
 }
 
 impl<'r> FromRow<'r, SqliteRow> for WhitelistRow {
@@ -96,9 +97,9 @@ mod tests {
     use anyhow::Result;
     use tempfile::tempdir;
 
-    use crate::db;
+    use crate::{application::ports::WhitelistEntry, db};
 
-    use super::{WhitelistEntry, WhitelistRepository};
+    use super::WhitelistRepository;
 
     #[tokio::test]
     async fn reports_duplicate_addition() -> Result<()> {

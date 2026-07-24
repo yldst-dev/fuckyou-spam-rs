@@ -14,14 +14,14 @@ use teloxide::{
 use tokio::time::Instant;
 
 use crate::{
+    application::{
+        chat_access::{chat_access_decision, ChatAccessDecision},
+        ports::{MessageSubmissionQueue, WhitelistGateway},
+    },
     config::AppConfig,
-    db::whitelist::WhitelistRepository,
-    domain::{types::QueueSnapshot, MessageJob},
-    tasks::queue::MessageQueue,
 };
 
-pub type QueueSnapshotProvider = Arc<dyn Fn() -> QueueSnapshot + Send + Sync>;
-pub type BotResult<T> = Result<T, teloxide::RequestError>;
+pub(crate) type BotResult<T> = Result<T, teloxide::RequestError>;
 
 const MEMBER_CACHE_TTL: Duration = Duration::from_secs(120);
 const MEMBER_CACHE_MAX_ENTRIES: usize = 10_000;
@@ -39,7 +39,7 @@ struct CachedMembership {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MessageRateLimitOutcome {
+pub(crate) enum MessageRateLimitOutcome {
     Allowed,
     UserLimited { report: bool },
     ChatLimited { report: bool },
@@ -206,27 +206,24 @@ impl MessageRateLimiter {
     }
 }
 
-pub struct AppState {
+pub(crate) struct AppState {
     pub config: Arc<AppConfig>,
-    pub whitelist: Arc<WhitelistRepository>,
-    pub queue: Arc<MessageQueue<MessageJob>>,
-    pub queue_snapshot: QueueSnapshotProvider,
+    pub whitelist: Arc<dyn WhitelistGateway>,
+    pub submission_queue: Arc<dyn MessageSubmissionQueue>,
     member_cache: Mutex<HashMap<(i64, u64), CachedMembership>>,
     rate_limiter: Mutex<MessageRateLimiter>,
 }
 
 impl AppState {
-    pub fn new(
+    pub(crate) fn new(
         config: Arc<AppConfig>,
-        whitelist: Arc<WhitelistRepository>,
-        queue: Arc<MessageQueue<MessageJob>>,
-        queue_snapshot: QueueSnapshotProvider,
+        whitelist: Arc<dyn WhitelistGateway>,
+        submission_queue: Arc<dyn MessageSubmissionQueue>,
     ) -> Self {
         Self {
             config,
             whitelist,
-            queue,
-            queue_snapshot,
+            submission_queue,
             member_cache: Mutex::new(HashMap::new()),
             rate_limiter: Mutex::new(MessageRateLimiter::new(
                 RateLimitConfig::default(),
@@ -235,28 +232,28 @@ impl AppState {
         }
     }
 
-    pub async fn is_chat_allowed(&self, chat_id: i64) -> bool {
-        if chat_id >= 0 {
-            return true;
+    pub(crate) async fn is_chat_allowed(&self, chat_id: i64) -> bool {
+        match chat_access_decision(
+            chat_id,
+            self.config.admin_group_id,
+            &self.config.allowed_chat_ids,
+        ) {
+            ChatAccessDecision::Allow => true,
+            ChatAccessDecision::CheckWhitelist => {
+                self.whitelist.is_allowed(chat_id).await.unwrap_or(false)
+            }
         }
-        if self.config.admin_group_id == Some(chat_id) {
-            return true;
-        }
-        if self.config.allowed_chat_ids.contains(&chat_id) {
-            return true;
-        }
-        self.whitelist.is_allowed(chat_id).await.unwrap_or(false)
     }
 
-    pub fn is_admin_group(&self, chat_id: i64) -> bool {
+    pub(crate) fn is_admin_group(&self, chat_id: i64) -> bool {
         self.config.admin_group_id == Some(chat_id)
     }
 
-    pub fn is_admin_user(&self, user_id: i64) -> bool {
+    pub(crate) fn is_admin_user(&self, user_id: i64) -> bool {
         self.config.admin_user_id == Some(user_id)
     }
 
-    pub fn check_message_rate(
+    pub(crate) fn check_message_rate(
         &self,
         chat_id: i64,
         user_id: Option<i64>,
@@ -266,7 +263,12 @@ impl AppState {
             .check(chat_id, user_id, Instant::now())
     }
 
-    pub async fn is_group_member(&self, bot: &Bot, chat_id: ChatId, user_id: UserId) -> bool {
+    pub(crate) async fn is_group_member(
+        &self,
+        bot: &Bot,
+        chat_id: ChatId,
+        user_id: UserId,
+    ) -> bool {
         let key = (chat_id.0, user_id.0);
         let now = Instant::now();
         if let Some(is_member) = self
@@ -323,7 +325,7 @@ impl AppState {
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "snake_case", description = "사용 가능한 명령어:")]
-pub enum GeneralCommand {
+pub(crate) enum GeneralCommand {
     #[command(description = "봇 소개 및 시작")]
     Start,
     #[command(description = "도움말")]

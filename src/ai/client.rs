@@ -1,22 +1,25 @@
 use anyhow::{Context, Result};
+use futures::future::BoxFuture;
 use reqwest::Client;
 
-use crate::{config::CerebrasConfig, domain::types::ClassificationMap};
+use crate::{
+    application::ports::SpamClassifier, config::CerebrasConfig, domain::types::ClassificationMap,
+};
 
 use super::inference::{build_request, parse_response, CEREBRAS_API_URL};
 
 #[derive(Clone)]
-pub struct CerebrasClient {
+pub(crate) struct CerebrasClient {
     http: Client,
     config: CerebrasConfig,
 }
 
 impl CerebrasClient {
-    pub fn new(http: Client, config: CerebrasConfig) -> Self {
+    pub(crate) fn new(http: Client, config: CerebrasConfig) -> Self {
         Self { http, config }
     }
 
-    pub async fn classify(&self, prompt: &str) -> Result<ClassificationMap> {
+    pub(crate) async fn classify(&self, prompt: &str) -> Result<ClassificationMap> {
         let request = build_request(self.config.model.clone(), prompt);
 
         tracing::debug!(
@@ -47,5 +50,11 @@ impl CerebrasClient {
 
         let classification = parse_response(response).await?;
         Ok(classification)
+    }
+}
+
+impl SpamClassifier for CerebrasClient {
+    fn classify<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Result<ClassificationMap>> {
+        Box::pin(CerebrasClient::classify(self, prompt))
     }
 }

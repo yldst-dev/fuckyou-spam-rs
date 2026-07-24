@@ -3,7 +3,7 @@ use std::{net::IpAddr, time::Duration};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
-pub struct AppConfig {
+pub(crate) struct AppConfig {
     pub telegram_bot_token: String,
     pub bot_username: Option<String>,
     pub admin_user_id: Option<i64>,
@@ -13,49 +13,42 @@ pub struct AppConfig {
     pub directories: DirectoryConfig,
     pub logging: LoggingConfig,
     pub timezone: String,
-    pub scheduler: SchedulerConfig,
     pub queue: QueueConfig,
     pub processor: ProcessorConfig,
     pub spam_cache: SpamCacheConfig,
     pub web: WebContentConfig,
     pub resilience: ResilienceConfig,
-    pub update: UpdateConfig,
 }
 
 #[derive(Debug, Clone)]
-pub struct CerebrasConfig {
+pub(crate) struct CerebrasConfig {
     pub api_key: String,
     pub model: String,
     pub request_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
-pub struct DirectoryConfig {
+pub(crate) struct DirectoryConfig {
     pub logs_dir: String,
     pub data_dir: String,
     pub db_filename: String,
 }
 
 #[derive(Debug, Clone)]
-pub struct LoggingConfig {
+pub(crate) struct LoggingConfig {
     pub level: String,
     pub file_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct SchedulerConfig {
-    pub cron_specs: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct QueueConfig {
+pub(crate) struct QueueConfig {
     pub max_messages: usize,
     pub high_priority_max: usize,
     pub normal_priority_max: usize,
 }
 
 #[derive(Debug, Clone)]
-pub struct ProcessorConfig {
+pub(crate) struct ProcessorConfig {
     pub batch_max_messages: usize,
     pub batch_max_chars: usize,
     pub retry_attempts: u32,
@@ -65,7 +58,7 @@ pub struct ProcessorConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct SpamCacheConfig {
+pub(crate) struct SpamCacheConfig {
     pub similarity_threshold: f64,
     pub scan_limit: i64,
     pub min_normalized_chars: usize,
@@ -77,7 +70,7 @@ pub struct SpamCacheConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct WebContentConfig {
+pub(crate) struct WebContentConfig {
     pub max_urls_per_message: usize,
     pub fetch_timeout: Duration,
     pub response_max_bytes: usize,
@@ -86,28 +79,14 @@ pub struct WebContentConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct ResilienceConfig {
+pub(crate) struct ResilienceConfig {
     pub network_error_threshold: u32,
     pub network_error_window: Duration,
     pub restart_cooldown: Duration,
 }
 
-#[derive(Debug, Clone)]
-pub struct UpdateConfig {
-    pub enabled: bool,
-    pub check_on_startup: bool,
-    pub auto_restart: bool,
-    pub repo_owner: String,
-    pub repo_name: String,
-    pub allowed_repo_owners: Vec<String>,
-    pub allowed_repo_names: Vec<String>,
-    pub allowed_asset_hosts: Vec<String>,
-    pub max_download_bytes: u64,
-    pub asset_sha256: Option<String>,
-}
-
 #[derive(Debug, Error)]
-pub enum ConfigError {
+pub(crate) enum ConfigError {
     #[error("missing required environment variable: {0}")]
     Missing(&'static str),
     #[error("invalid environment variable: {0}")]

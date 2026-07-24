@@ -1,7 +1,6 @@
-pub mod directories;
-pub mod health;
-pub mod instance_guard;
-pub mod logging;
-pub mod notifier;
-pub mod shutdown;
-pub mod updater;
+pub(crate) mod directories;
+pub(crate) mod health;
+pub(crate) mod instance_guard;
+pub(crate) mod logging;
+pub(crate) mod notifier;
+pub(crate) mod shutdown;

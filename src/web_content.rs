@@ -17,26 +17,26 @@ use tokio::time::error::Elapsed;
 use tracing::warn;
 use url::Url;
 
-use crate::{config::WebContentConfig, domain::WebContent};
+use crate::{application::ports::WebContentReader, config::WebContentConfig, domain::WebContent};
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_PINNED_CLIENTS: usize = 128;
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
-pub struct WebContentFetcher {
+pub(crate) struct WebContentFetcher {
     config: WebContentConfig,
     pinned_clients: Mutex<HashMap<PinnedClientKey, Client>>,
 }
 
 impl WebContentFetcher {
-    pub fn new(config: WebContentConfig) -> Result<Self> {
+    pub(crate) fn new(config: WebContentConfig) -> Result<Self> {
         Ok(Self {
             config,
             pinned_clients: Mutex::new(HashMap::new()),
         })
     }
 
-    pub async fn fetch(&self, raw_url: &str) -> Result<Option<WebContent>> {
+    pub(crate) async fn fetch(&self, raw_url: &str) -> Result<Option<WebContent>> {
         let mut url = match Url::parse(raw_url) {
             Ok(url) => url,
             _ => return Ok(None),
@@ -255,6 +255,15 @@ impl WebContentFetcher {
         }
 
         Ok(Some(String::from_utf8_lossy(&body).into_owned()))
+    }
+}
+
+impl WebContentReader for WebContentFetcher {
+    fn fetch<'a>(
+        &'a self,
+        raw_url: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Option<WebContent>>> {
+        Box::pin(WebContentFetcher::fetch(self, raw_url))
     }
 }
 

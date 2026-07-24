@@ -1,8 +1,13 @@
 use chrono::{DateTime, Utc};
-use teloxide::{prelude::*, types::MessageId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ChatId(pub i64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct MessageId(pub i32);
 
 #[derive(Debug, Clone)]
-pub struct MessageJob {
+pub(crate) struct MessageJob {
     pub chat_id: ChatId,
     pub chat_title: Option<String>,
     pub message_id: MessageId,

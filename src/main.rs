@@ -1,5 +1,6 @@
 mod ai;
 mod app;
+mod application;
 mod config;
 mod db;
 mod domain;
@@ -9,7 +10,7 @@ mod telegram;
 mod web_content;
 
 use anyhow::Result;
-use infrastructure::{directories, health, instance_guard, logging, shutdown, updater};
+use infrastructure::{directories, health, instance_guard, logging, shutdown};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,10 +23,6 @@ async fn main() -> Result<()> {
     }
     logging::init_tracing(&config, &paths)?;
     let _instance_guard = instance_guard::InstanceGuard::acquire(&paths)?;
-
-    if let Err(err) = updater::auto_update_on_startup(&config, &paths).await {
-        tracing::warn!(target: "update", error = %err, "자동 업데이트에 실패했습니다");
-    }
 
     let (shutdown, _) = shutdown::Shutdown::new();
     shutdown::install_signal_handlers(shutdown.clone());

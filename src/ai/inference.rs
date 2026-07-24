@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::types::ClassificationMap;
 
-pub const CEREBRAS_API_URL: &str = "https://api.cerebras.ai/v1/chat/completions";
+pub(crate) const CEREBRAS_API_URL: &str = "https://api.cerebras.ai/v1/chat/completions";
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
 const SYSTEM_PROMPT: &str = r#"You are a bot that reads Telegram messages (including quoted channel/group content and extracted link previews) and classifies them as spam or not spam. Focus only on spam detection—do not censor or flag content just because it contains adult language/images unless it is clearly promotional spam.
 Classify as spam (true) ONLY if at least one of the following is present:
@@ -37,7 +37,7 @@ Example classification for the message
 item_0: <message>실시간 종목타점 공유하는 채널 ... 확인하기(URL: https://t.me/c/2485256729/1/205)</message>
 Output: {"item_0": {"spam": true, "reason": "실시간 종목타점 텔레그램 채널 홍보"}}."#;
 
-pub fn build_request(model: String, prompt: &str) -> ChatCompletionRequest {
+pub(crate) fn build_request(model: String, prompt: &str) -> ChatCompletionRequest {
     ChatCompletionRequest {
         model,
         messages: vec![
@@ -59,7 +59,7 @@ pub fn build_request(model: String, prompt: &str) -> ChatCompletionRequest {
     }
 }
 
-pub async fn parse_response(response: Response) -> Result<ClassificationMap> {
+pub(crate) async fn parse_response(response: Response) -> Result<ClassificationMap> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
@@ -92,7 +92,7 @@ pub async fn parse_response(response: Response) -> Result<ClassificationMap> {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ChatCompletionRequest {
+pub(crate) struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub temperature: f32,
@@ -102,28 +102,28 @@ pub struct ChatCompletionRequest {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ChatMessage {
+pub(crate) struct ChatMessage {
     pub role: String,
     pub content: String,
 }
 
 #[derive(Debug, Serialize)]
-pub struct ResponseFormat {
+pub(crate) struct ResponseFormat {
     #[serde(rename = "type")]
     pub r#type: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ChatCompletionResponse {
+pub(crate) struct ChatCompletionResponse {
     pub choices: Vec<ChatChoice>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ChatChoice {
+pub(crate) struct ChatChoice {
     pub message: Option<ChatCompletionMessage>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ChatCompletionMessage {
+pub(crate) struct ChatCompletionMessage {
     pub content: Option<String>,
 }

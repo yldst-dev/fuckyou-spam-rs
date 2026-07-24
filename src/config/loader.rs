@@ -2,11 +2,10 @@ use std::{env, net::IpAddr};
 
 use super::env::{
     AppConfig, CerebrasConfig, ConfigError, DirectoryConfig, LoggingConfig, ProcessorConfig,
-    QueueConfig, ResilienceConfig, SchedulerConfig, SpamCacheConfig, UpdateConfig,
-    WebContentConfig,
+    QueueConfig, ResilienceConfig, SpamCacheConfig, WebContentConfig,
 };
 
-pub fn load_config() -> Result<AppConfig, ConfigError> {
+pub(crate) fn load_config() -> Result<AppConfig, ConfigError> {
     AppConfig::from_env()
 }
 
@@ -50,18 +49,6 @@ impl AppConfig {
         };
 
         let timezone = env::var("BOT_TIMEZONE").unwrap_or_else(|_| "Asia/Seoul".to_string());
-
-        let scheduler = SchedulerConfig {
-            cron_specs: env::var("RESTART_CRONS")
-                .map(|value| {
-                    value
-                        .split(';')
-                        .map(|part| part.trim().to_string())
-                        .filter(|part| !part.is_empty())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|_| vec!["0 0 0 * * *".to_string(), "0 0 12 * * *".to_string()]),
-        };
 
         let queue = QueueConfig {
             max_messages: parse_usize_env("QUEUE_MAX_MESSAGES", 5_000),
@@ -138,38 +125,6 @@ impl AppConfig {
             ),
         };
 
-        let update = UpdateConfig {
-            enabled: parse_bool_env("AUTO_UPDATE_ENABLED").unwrap_or(false),
-            check_on_startup: parse_bool_env("AUTO_UPDATE_CHECK_ON_STARTUP").unwrap_or(true),
-            auto_restart: parse_bool_env("AUTO_UPDATE_AUTO_RESTART").unwrap_or(true),
-            repo_owner: env::var("AUTO_UPDATE_REPO_OWNER")
-                .unwrap_or_else(|_| "yldst-dev".to_string()),
-            repo_name: env::var("AUTO_UPDATE_REPO_NAME")
-                .unwrap_or_else(|_| "fuckyou-spam-rs".to_string()),
-            allowed_repo_owners: parse_csv_env("AUTO_UPDATE_ALLOWED_REPO_OWNERS", &["yldst-dev"]),
-            allowed_repo_names: parse_csv_env(
-                "AUTO_UPDATE_ALLOWED_REPO_NAMES",
-                &["fuckyou-spam-rs"],
-            ),
-            allowed_asset_hosts: parse_csv_env(
-                "AUTO_UPDATE_ASSET_HOST_ALLOWLIST",
-                &[
-                    "github.com",
-                    "objects.githubusercontent.com",
-                    "github-releases.githubusercontent.com",
-                ],
-            ),
-            max_download_bytes: env::var("AUTO_UPDATE_MAX_DOWNLOAD_BYTES")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(50 * 1024 * 1024),
-            asset_sha256: env::var("AUTO_UPDATE_ASSET_SHA256")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty()),
-        };
-        validate_update_config(&update)?;
-
         Ok(Self {
             telegram_bot_token,
             bot_username,
@@ -180,13 +135,11 @@ impl AppConfig {
             directories,
             logging,
             timezone,
-            scheduler,
             queue,
             processor,
             spam_cache,
             web,
             resilience,
-            update,
         })
     }
 }
@@ -197,20 +150,6 @@ fn required_non_empty(key: &'static str) -> Result<String, ConfigError> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or(ConfigError::Missing(key))
-}
-
-fn validate_update_config(update: &UpdateConfig) -> Result<(), ConfigError> {
-    if !update.enabled {
-        return Ok(());
-    }
-    let checksum = update
-        .asset_sha256
-        .as_deref()
-        .ok_or(ConfigError::Missing("AUTO_UPDATE_ASSET_SHA256"))?;
-    if checksum.len() != 64 || !checksum.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(ConfigError::Invalid("AUTO_UPDATE_ASSET_SHA256"));
-    }
-    Ok(())
 }
 
 fn parse_int(key: &str) -> Option<i64> {
@@ -227,20 +166,6 @@ fn parse_bool_env(key: &str) -> Option<bool> {
             "0" | "false" | "no" | "off" => Some(false),
             _ => None,
         })
-}
-
-fn parse_csv_env(key: &str, default: &[&str]) -> Vec<String> {
-    env::var(key)
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(|part| part.trim().to_string())
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .filter(|values| !values.is_empty())
-        .unwrap_or_else(|| default.iter().map(|value| value.to_string()).collect())
 }
 
 fn parse_ip_list_env(key: &'static str) -> Result<Vec<IpAddr>, ConfigError> {
@@ -302,21 +227,6 @@ fn parse_f64_env(key: &str, default: f64) -> f64 {
 mod tests {
     use super::*;
 
-    fn update_config(enabled: bool, checksum: Option<&str>) -> UpdateConfig {
-        UpdateConfig {
-            enabled,
-            check_on_startup: true,
-            auto_restart: true,
-            repo_owner: "owner".to_string(),
-            repo_name: "repo".to_string(),
-            allowed_repo_owners: vec!["owner".to_string()],
-            allowed_repo_names: vec!["repo".to_string()],
-            allowed_asset_hosts: vec!["example.com".to_string()],
-            max_download_bytes: 1024,
-            asset_sha256: checksum.map(str::to_string),
-        }
-    }
-
     #[test]
     fn parses_blocked_ip_list() {
         let values =
@@ -329,13 +239,5 @@ mod tests {
     #[test]
     fn rejects_invalid_blocked_ip() {
         assert!(parse_ip_list_value("WEBPAGE_BLOCKED_IPS", "not-an-ip").is_err());
-    }
-
-    #[test]
-    fn requires_detached_checksum_for_enabled_updates() {
-        assert!(validate_update_config(&update_config(true, None)).is_err());
-        assert!(validate_update_config(&update_config(true, Some("invalid"))).is_err());
-        assert!(validate_update_config(&update_config(true, Some(&"a".repeat(64)))).is_ok());
-        assert!(validate_update_config(&update_config(false, None)).is_ok());
     }
 }

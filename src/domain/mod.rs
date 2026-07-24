@@ -1,7 +1,7 @@
-pub mod message;
-pub mod types;
+pub(crate) mod message;
+pub(crate) mod types;
 
-pub use message::MessageJob;
-pub use types::{
+pub(crate) use message::{ChatId, MessageId, MessageJob};
+pub(crate) use types::{
     ClassificationDecision, ClassificationMap, MessageFingerprint, QueueSnapshot, WebContent,
 };

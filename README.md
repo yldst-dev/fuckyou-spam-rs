@@ -7,11 +7,11 @@ Telegram 그룹의 메시지를 SQLite 스팸 캐시와 Cerebras AI로 분류하
 - Telegram long polling 기반 메시지 수신
 - SQLite 화이트리스트와 판정 캐시
 - 확인된 동일 메시지의 LLM 호출 생략
-- 채팅별 비가역 유사 해시를 LLM 판단 근거로 활용
+- 원문을 저장하지 않는 채팅별 64비트 유사도 해시를 LLM 판단 근거로 활용
 - 사용자·채팅별 요청 제한과 bounded 우선순위 큐
 - 채팅별 일괄 AI 분류 후 스팸 건별 독립 재확인
 - URL 본문 추출과 분석
-- 종료 신호 처리와 Docker 재시작 정책
+- 종료 신호 처리와 Docker 기반 수명주기 관리
 
 ## 처리 흐름
 
@@ -19,7 +19,8 @@ Telegram 그룹의 메시지를 SQLite 스팸 캐시와 Cerebras AI로 분류하
 flowchart LR
     A["Telegram 메시지"] --> B["화이트리스트 확인"]
     B --> C["우선순위 큐"]
-    C --> D{"SQLite exact 판정"}
+    C --> K["정규화·fingerprint"]
+    K --> D{"SQLite exact 판정"}
     D -->|"확인된 스팸"| E["메시지 삭제"]
     D -->|"없음"| F["유사 후보·웹 본문 수집"]
     F --> G["채팅별 Cerebras 1차 분류"]
@@ -51,7 +52,7 @@ Compose는 다음 운영 기본값을 적용합니다.
 - `/app/data` named volume 영속화
 - stdout 로그와 Docker 로그 순환
 - SQLite와 처리 루프 heartbeat 헬스체크
-- 컨테이너 내부 자동 업데이트와 예약 재시작 비활성화
+- Docker와 Dokploy가 담당하는 재시작 및 배포 수명주기
 
 SQLite DB, WAL, 런타임 잠금은 `bot-data` named volume에 저장됩니다. `docker compose down`은 데이터를 유지하지만 `docker compose down -v`는 볼륨까지 삭제합니다.
 
@@ -61,36 +62,9 @@ Compose는 파일 로그를 끄고 stdout만 사용합니다. 애플리케이션
 
 ## Dokploy
 
-Dokploy에서 서비스 유형을 `Compose`로 만들고 Compose Path를 `compose.yaml`로 설정합니다.
+Dokploy에서는 `compose.yaml`을 사용하는 Compose 프로젝트로 배포하고 replica를 1개로 유지합니다. 공개 포트와 도메인은 필요하지 않으며 업데이트와 재시작은 Git 배포, Dokploy, Docker가 담당합니다.
 
-1. 저장소와 배포 브랜치를 연결합니다.
-2. Environment 탭에 `.env.example`의 키를 등록하고 비밀값을 입력합니다.
-3. Docker Compose 모드를 선택하고 배포합니다.
-4. replica는 1개로 유지합니다.
-5. 포트와 도메인은 등록하지 않습니다.
-6. `bot-data` named volume에 S3 Volume Backup을 설정합니다.
-
-Dokploy는 Environment 탭 값을 Compose 파일 옆의 `.env`로 저장하며, `env_file`이 이를 컨테이너에 주입합니다. `COMPOSE_PROJECT_NAME`, Dokploy 애플리케이션 이름, `bot-data` 볼륨 이름을 변경하면 기존 볼륨 연결이 달라질 수 있습니다.
-
-SQLite 백업은 Volume Backup의 `Turn off Container`를 활성화한 상태로 트래픽이 적은 시간에 실행하는 것이 안전합니다. WAL 모드는 같은 호스트의 로컬 named volume에서만 사용하고 NFS·CIFS 공유 볼륨에는 두지 않습니다.
-
-Compose에는 `build`만 두고 고정된 로컬 `image` 이름을 사용하지 않습니다. 이 구성은 Dokploy 프로젝트 간 이미지 이름 충돌과 불필요한 pull 시도를 피합니다. CI에서 이미지를 발행하는 방식으로 전환할 때는 `build`를 제거하고 registry의 커밋 SHA 태그 또는 digest만 사용합니다.
-
-컨테이너에서는 아래 값이 Compose에 의해 강제로 적용됩니다.
-
-```env
-AUTO_UPDATE_ENABLED=false
-DATA_DIR=/app/data
-LOG_TO_FILE=false
-LOGS_DIR=/tmp/logs
-RESTART_CRONS=
-```
-
-업데이트는 컨테이너 내부 바이너리 교체가 아니라 Git push 후 Dokploy 재배포로 수행합니다.
-
-- [Dokploy Docker Compose](https://docs.dokploy.com/docs/core/docker-compose)
-- [Dokploy Volume Backups](https://docs.dokploy.com/docs/core/volume-backups)
-- [SQLite WAL](https://www.sqlite.org/wal.html)
+환경변수 설정, SQLite 볼륨 백업, 이미지 공급망과 배포 검증 절차는 [Dokploy Compose 배포 문서](docs/DEPLOY_DOKPLOY.md)를 참고하십시오.
 
 ## 소스 실행
 
@@ -98,8 +72,6 @@ RESTART_CRONS=
 cargo build --release --locked
 cargo run --release --locked
 ```
-
-소스 실행에서 예약 재시작이 필요하지 않으면 `.env`의 `RESTART_CRONS`를 빈 값으로 유지합니다. systemd나 Docker 같은 프로세스 관리자가 있을 때는 내부 재시작과 자동 업데이트를 함께 사용하지 않는 것이 안전합니다.
 
 ## 환경변수
 
@@ -140,21 +112,10 @@ cargo run --release --locked
 | `SPAM_CACHE_TENTATIVE_TTL_SECS` | `86400` | 잠정 스팸 보존 시간 |
 | `SPAM_CACHE_CONFIRMED_TTL_SECS` | `7776000` | 확인된 스팸 보존 시간 |
 | `SPAM_CACHE_PRUNE_INTERVAL_SECS` | `3600` | 만료 캐시 정리 주기 |
-| `BOT_TIMEZONE` | `Asia/Seoul` | 스케줄 기준 시간대 |
-| `RESTART_CRONS` | 빈 값 권장 | 내부 재시작 cron 목록 |
+| `BOT_TIMEZONE` | `Asia/Seoul` | 관리 알림 표시 시간대 |
 | `NETWORK_ERROR_THRESHOLD` | `5` | 네트워크 오류 임계값 |
 | `NETWORK_ERROR_WINDOW_SECS` | `60` | 네트워크 오류 집계 구간 |
-| `EMERGENCY_RESTART_COOLDOWN_SECS` | `600` | 비상 재시작 간격 |
-| `AUTO_UPDATE_ENABLED` | `false` | 릴리스 자동 업데이트 |
-| `AUTO_UPDATE_CHECK_ON_STARTUP` | `true` | 시작 시 업데이트 확인 |
-| `AUTO_UPDATE_AUTO_RESTART` | `true` | 업데이트 후 재실행 |
-| `AUTO_UPDATE_REPO_OWNER` | `yldst-dev` | 릴리스 저장소 소유자 |
-| `AUTO_UPDATE_REPO_NAME` | `fuckyou-spam-rs` | 릴리스 저장소 이름 |
-| `AUTO_UPDATE_ALLOWED_REPO_OWNERS` | `yldst-dev` | 허용 저장소 소유자 목록 |
-| `AUTO_UPDATE_ALLOWED_REPO_NAMES` | `fuckyou-spam-rs` | 허용 저장소 이름 목록 |
-| `AUTO_UPDATE_ASSET_HOST_ALLOWLIST` | GitHub 릴리스 호스트 | 허용 다운로드 호스트 |
-| `AUTO_UPDATE_MAX_DOWNLOAD_BYTES` | `52428800` | 릴리스 다운로드 상한 |
-| `AUTO_UPDATE_ASSET_SHA256` | 없음 | 자동 업데이트 활성화 시 필수인 외부 검증 SHA-256 |
+| `EMERGENCY_RESTART_COOLDOWN_SECS` | `600` | 볼륨에 유지되는 비상 재시작 최소 간격 |
 
 ## 관리 명령
 

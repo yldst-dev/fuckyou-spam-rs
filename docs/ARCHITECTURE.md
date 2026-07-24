@@ -15,9 +15,9 @@ flowchart TD
     B -->|"아니요"| C["무시"]
     B -->|"예"| R{"사용자·채팅 rate limit"}
     R -->|"초과"| C
-    R -->|"허용"| D["메시지 정규화와 fingerprint"]
-    D --> E["우선순위 큐"]
-    E --> F{"SQLite exact 활성 판정"}
+    R -->|"허용"| E["우선순위 큐"]
+    E --> D["메시지 정규화와 fingerprint"]
+    D --> F{"SQLite exact 활성 판정"}
     F -->|"스팸"| G["Telegram 메시지 삭제"]
     G --> H["hit_count와 last_seen_at 갱신"]
     F -->|"없음"| I["유사 후보와 URL 본문 제한 수집"]
@@ -36,40 +36,64 @@ flowchart TD
 | 모듈 | 책임 |
 | --- | --- |
 | `config` | 환경변수 파싱과 검증 |
+| `domain` | Telegram 구현과 독립된 메시지 ID, 판정, fingerprint 모델 |
+| `application::ports` | AI, SQLite, 웹 수집, 메시지 삭제, 화이트리스트, 접수 큐의 추상 인터페이스 |
+| `application::chat_access` | 설정과 화이트리스트 조회 여부를 결정하는 순수 접근 정책 |
+| `application::decision_policy` | 캐시 적중, 1차 분류, 독립 재확인 결과에 따른 순수 의사결정 |
 | `telegram` | Telegram dispatcher와 관리 명령 |
 | `tasks::queue` | 높은 우선순위와 일반 우선순위 큐 |
-| `tasks::processor` | 캐시 조회, 웹 수집, AI 분류, 삭제 |
-| `ai` | Cerebras 요청과 응답 파싱 |
+| `tasks::processor` | 처리 흐름 조정, 캐시 조회, 웹 수집, 삭제 |
+| `ai` | `SpamClassifier` 구현과 Cerebras 요청·응답 파싱 |
 | `web_content` | URL 검증, 제한 다운로드, 본문 추출 |
 | `db::whitelist` | 허용 채팅 영속화 |
 | `db::spam_cache` | exact hash와 유사 스팸 캐시 |
 | `infrastructure` | 디렉터리, 로그, 종료, 단일 인스턴스 |
 | `app` | 의존성 조립과 수명주기 |
 
+핵심 의사결정은 `application`의 순수 정책과 포트에 의존합니다. Telegram 타입은 어댑터 경계에서 도메인의 `ChatId`, `MessageId`로 변환합니다. AI, SQLite, 웹 수집, 메시지 삭제, 화이트리스트, 접수 큐 구현은 포트를 통해 주입합니다.
+
+```mermaid
+flowchart LR
+    T["Telegram adapter"] --> A["Application policy·ports"]
+    P["MessageProcessor"] --> A
+    A --> D["Domain"]
+    C["Cerebras adapter"] --> A
+    S["SQLite adapter"] --> A
+    W["Web adapter"] --> A
+    M["Telegram moderation adapter"] --> A
+    R["app composition root"] --> T
+    R --> P
+    R --> C
+    R --> S
+    R --> W
+    R --> M
+```
+
 ## SQLite
 
-하나의 SQLite 파일에 `whitelist`와 `message_decisions`를 저장합니다. 연결은 WAL 모드, 5초 busy timeout, 최대 5개 연결을 사용합니다.
+하나의 SQLite 파일에 `whitelist`, `message_decisions`, `message_decision_evidence`를 저장합니다. 연결은 WAL 모드, 5초 busy timeout, 최대 5개 연결을 사용합니다.
 
 ```mermaid
 flowchart LR
     A["spam-bot"] --> B["/app/data/whitelist.db"]
     B --> C["whitelist"]
     B --> D["message_decisions"]
-    B --> E["WAL과 SHM"]
-    B --> F["bot-data named volume"]
-    F --> G["Dokploy S3 Volume Backup"]
+    B --> E["message_decision_evidence"]
+    B --> F["WAL과 SHM"]
+    B --> G["bot-data named volume"]
+    G --> H["Dokploy S3 Volume Backup"]
 ```
 
 WAL 파일과 SHM 파일은 DB와 같은 볼륨에 있어야 합니다. SQLite WAL은 네트워크 파일시스템을 지원하지 않으므로 named volume은 Dokploy가 실행되는 단일 호스트의 로컬 스토리지를 사용합니다.
 
-새 판정 캐시는 원문과 출처 ID를 저장하지 않고 채팅 범위 해시, exact 해시, 비가역 SimHash, 판정, 증거 수, 정책 버전과 만료 시각만 저장합니다. 출처는 SHA-256으로 익명화하고 서로 다른 값만 증거로 계산합니다. 보안 마이그레이션은 이전 `spam_messages`와 복원 가능한 정규화 원문을 삭제하며 `secure_delete`를 활성화합니다.
+새 판정 캐시는 원문과 출처 ID를 저장하지 않고 채팅 범위 해시, exact 해시, 64비트 SimHash 유사도 지문, 판정, 증거 수, 정책 버전과 만료 시각만 저장합니다. SimHash는 유사도 비교용 요약값이며 암호학적 해시가 아닙니다. 출처는 SHA-256으로 익명화해 `message_decision_evidence`에 저장하고 서로 다른 값만 증거로 계산합니다. 보안 마이그레이션은 이전 `spam_messages`와 복원 가능한 정규화 원문을 삭제하며 `secure_delete`를 활성화합니다.
 
 ## 컨테이너
 
 Docker 이미지는 두 단계로 빌드합니다.
 
 1. Rust builder가 `Cargo.lock`을 고정하고 프로젝트 전용 Cargo registry cache만 재사용합니다.
-2. Debian slim runtime에는 strip한 바이너리와 CA 인증서만 복사합니다.
+2. Debian slim runtime에 CA 인증서를 설치하고 strip한 바이너리만 builder에서 복사합니다.
 
 컨테이너는 UID/GID 10001로 실행하며 루트 파일시스템은 읽기 전용입니다. `/app/data`만 named volume으로 영속화하고 `/tmp`는 64MB tmpfs로 제한합니다.
 
@@ -97,7 +121,7 @@ flowchart TD
     E --> F["기존 bot-data 연결"]
 ```
 
-컨테이너 내부 예약 재시작과 자동 업데이트는 비활성화합니다. Docker의 `restart: unless-stopped`와 Dokploy 재배포가 프로세스 수명주기를 관리합니다.
+애플리케이션에는 컨테이너 내부 예약 재시작과 자동 업데이트 기능을 두지 않습니다. Docker의 `restart: unless-stopped`와 Dokploy 재배포가 프로세스 수명주기를 관리합니다.
 
 Compose에는 HTTP 포트와 도메인이 없습니다. Telegram, Cerebras, 외부 URL에 대한 outbound 연결만 필요하며 Traefik 네트워크에 연결하지 않습니다.
 
@@ -107,7 +131,9 @@ Compose에는 HTTP 포트와 도메인이 없습니다. Telegram, Cerebras, 외�
 
 Compose는 파일 로그를 비활성화합니다. 초기화에 필요한 `LOGS_DIR`는 `/tmp/logs`로 두며 장기 보존이 필요하면 stdout 로그를 외부 수집기로 전달합니다.
 
-전용 `healthcheck` 명령은 처리 루프 heartbeat의 최근 갱신 시각과 SQLite `PRAGMA quick_check`를 검사합니다. Compose는 30초마다 실행하고 시작 후 60초의 준비 시간을 허용합니다. URL 수집과 AI 재시도 중에도 heartbeat를 갱신하며 4분 이상 갱신되지 않으면 비정상으로 판단합니다.
+전용 `healthcheck` 명령은 처리 루프 heartbeat의 최근 갱신 시각과 SQLite `PRAGMA quick_check`를 검사합니다. Compose는 30초마다 실행하고 시작 후 60초의 준비 시간을 허용합니다. URL 수집과 AI 재시도 중에도 heartbeat를 갱신하며 4분 이상 갱신되지 않으면 비정상으로 판단합니다. Docker는 `unhealthy` 상태만으로 컨테이너를 재시작하지 않으므로 애플리케이션의 독립 모니터가 heartbeat 오류를 3회 연속 확인하면 프로세스를 종료하고 `restart: unless-stopped`가 재기동합니다.
+
+Telegram 네트워크 장애가 임계값에 도달하면 종료 신호를 먼저 발생시키고 관리자 알림은 3초 제한의 best-effort로 전송합니다. 마지막 비상 재시작 시각은 `/app/data/emergency-restart.timestamp`에 저장해 컨테이너 재생성 후에도 재시작 최소 간격을 유지합니다.
 
 ## 백업과 복구
 
@@ -119,7 +145,7 @@ Dokploy Volume Backup은 `bot-data` named volume을 S3에 저장합니다. 실�
 
 - replica는 1개만 사용합니다.
 - `bot-data`를 NFS나 CIFS에 두지 않습니다.
-- `AUTO_UPDATE_ENABLED=false`를 유지합니다.
-- `RESTART_CRONS`는 빈 값으로 유지합니다.
+- 업데이트는 Git push 후 Dokploy 재배포로 수행합니다.
+- 재시작은 Docker와 Dokploy에서 관리합니다.
 - 비밀값은 Dokploy Environment에만 저장합니다.
 - `docker compose down -v`는 운영 환경에서 실행하지 않습니다.

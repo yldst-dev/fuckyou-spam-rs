@@ -5,29 +5,31 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
-use chrono_tz::Tz;
+use anyhow::Result;
 use futures::{stream, StreamExt};
-use teloxide::{prelude::*, types::ParseMode};
 use tokio::{
     task::JoinHandle,
     time::{sleep, Instant},
 };
 
 use crate::{
-    ai::CerebrasClient,
-    config::AppConfig,
-    db::spam_cache::{
-        CachePolicy, CachedDecision, DecisionInput, DecisionState, DecisionVerdict,
-        FuzzySpamCandidate, SpamCacheRepository,
+    application::{
+        decision_policy::{
+            cache_action, confirmation_action, initial_action, CacheAction, ConfirmationAction,
+            InitialAction,
+        },
+        ports::{
+            CachePolicy, CachedDecision, DecisionInput, DecisionState, DecisionVerdict,
+            FuzzySpamCandidate, MessageModerationGateway, SpamClassifier, SpamDecisionStore,
+            WebContentReader,
+        },
     },
+    config::AppConfig,
     domain::{
         ClassificationDecision, ClassificationMap, MessageFingerprint, MessageJob, WebContent,
     },
     infrastructure::{health, shutdown::ShutdownListener},
     tasks::queue::{MessageQueue, Priority, QueuePushOutcome},
-    web_content::WebContentFetcher,
 };
 
 const DEFAULT_REASON: &str = "모델이 사유를 제공하지 않았습니다.";
@@ -47,38 +49,38 @@ struct PreparedGroup {
     entry: String,
 }
 
-pub struct MessageProcessor {
+pub(crate) struct MessageProcessor {
     queue: Arc<MessageQueue<MessageJob>>,
-    bot: Bot,
-    cerebras: Arc<CerebrasClient>,
-    web_fetcher: Arc<WebContentFetcher>,
-    spam_cache: Arc<SpamCacheRepository>,
+    classifier: Arc<dyn SpamClassifier>,
+    web_reader: Arc<dyn WebContentReader>,
+    decision_store: Arc<dyn SpamDecisionStore>,
+    moderation: Arc<dyn MessageModerationGateway>,
     config: Arc<AppConfig>,
     heartbeat_path: PathBuf,
 }
 
 impl MessageProcessor {
-    pub fn new(
+    pub(crate) fn new(
         queue: Arc<MessageQueue<MessageJob>>,
-        bot: Bot,
-        cerebras: Arc<CerebrasClient>,
-        web_fetcher: Arc<WebContentFetcher>,
-        spam_cache: Arc<SpamCacheRepository>,
+        classifier: Arc<dyn SpamClassifier>,
+        web_reader: Arc<dyn WebContentReader>,
+        decision_store: Arc<dyn SpamDecisionStore>,
+        moderation: Arc<dyn MessageModerationGateway>,
         config: Arc<AppConfig>,
         heartbeat_path: PathBuf,
     ) -> Self {
         Self {
             queue,
-            bot,
-            cerebras,
-            web_fetcher,
-            spam_cache,
+            classifier,
+            web_reader,
+            decision_store,
+            moderation,
             config,
             heartbeat_path,
         }
     }
 
-    pub fn spawn(self: Arc<Self>, mut shutdown: ShutdownListener) -> JoinHandle<Result<()>> {
+    pub(crate) fn spawn(self: Arc<Self>, mut shutdown: ShutdownListener) -> JoinHandle<Result<()>> {
         tokio::spawn(async move { self.run_loop(&mut shutdown).await })
     }
 
@@ -132,7 +134,11 @@ impl MessageProcessor {
     }
 
     async fn prune_cache(&self) {
-        match self.spam_cache.prune_expired_batch(PRUNE_BATCH_SIZE).await {
+        match self
+            .decision_store
+            .prune_expired_batch(PRUNE_BATCH_SIZE)
+            .await
+        {
             Ok(removed) if removed > 0 => {
                 tracing::info!(
                     target: "db",
@@ -162,8 +168,15 @@ impl MessageProcessor {
                 .fingerprint
                 .as_ref()
                 .and_then(|fingerprint| exact.get(&fingerprint.text_hash));
-            match decision {
-                Some(decision) if decision.verdict == DecisionVerdict::Spam => {
+            match (
+                cache_action(
+                    decision
+                        .map(|decision| decision.verdict == DecisionVerdict::Spam)
+                        .unwrap_or(false),
+                ),
+                decision,
+            ) {
+                (CacheAction::Delete, Some(decision)) => {
                     self.apply_cached_spam(&group.jobs, decision).await;
                 }
                 _ => pending.push(group),
@@ -247,7 +260,7 @@ impl MessageProcessor {
             })
             .collect::<Vec<_>>();
         match self
-            .spam_cache
+            .decision_store
             .find_exact_batch(
                 &hashes,
                 &self.config.spam_cache.policy_version,
@@ -272,7 +285,7 @@ impl MessageProcessor {
         let reason = sanitize_reason(decision.reason.as_deref());
         let mut deleted = 0usize;
         for job in jobs {
-            match self.delete_spam(job, &reason).await {
+            match self.moderation.delete_spam(job, &reason).await {
                 Ok(()) => deleted += 1,
                 Err(err) => {
                     tracing::error!(
@@ -295,7 +308,7 @@ impl MessageProcessor {
                 deleted,
                 "exact spam decision cache applied"
             );
-            if let Err(err) = self.spam_cache.mark_hit(decision.id).await {
+            if let Err(err) = self.decision_store.mark_hit(decision.id).await {
                 tracing::warn!(
                     target: "db",
                     error = %err,
@@ -315,7 +328,7 @@ impl MessageProcessor {
             .filter_map(|group| group.fingerprint.clone())
             .collect::<Vec<_>>();
         match self
-            .spam_cache
+            .decision_store
             .find_similar_candidates_batch(
                 &fingerprints,
                 self.config.spam_cache.similarity_threshold,
@@ -370,7 +383,7 @@ impl MessageProcessor {
         }
 
         for url in &representative.urls {
-            match self.web_fetcher.fetch(url).await {
+            match self.web_reader.fetch(url).await {
                 Ok(Some(content)) => {
                     entry.push_str("\n웹페이지 정보 (");
                     entry.push_str(&url_for_prompt(url));
@@ -437,7 +450,7 @@ impl MessageProcessor {
     ) -> Option<ClassificationMap> {
         for attempt in 1..=self.config.processor.retry_attempts {
             let result = tokio::select! {
-                result = self.cerebras.classify(prompt) => result,
+                result = self.classifier.classify(prompt) => result,
                 _ = shutdown.notified() => return None,
             };
             match result {
@@ -485,39 +498,47 @@ impl MessageProcessor {
         decision: &ClassificationDecision,
         shutdown: &mut ShutdownListener,
     ) {
-        if !decision.spam {
-            return;
+        match initial_action(decision) {
+            InitialAction::Confirm => {}
+            InitialAction::Ignore => return,
         }
 
         let expected = HashSet::from(["item_0".to_string()]);
         let serialized = serde_json::to_string(&group.entry)
             .unwrap_or_else(|_| "\"메시지 직렬화 실패\"".to_string());
         let confirmation_prompt = format!("item_0: {serialized}");
-        let Some(confirmation) = self
+        let confirmation = self
             .classify_with_retry(&confirmation_prompt, &expected, shutdown)
-            .await
-        else {
-            if !shutdown.is_triggered() {
-                self.requeue_group(group);
+            .await;
+        let confirmed = confirmation
+            .as_ref()
+            .and_then(|classification| classification.get("item_0"));
+        let confirmed = match confirmation_action(confirmed, shutdown.is_triggered()) {
+            ConfirmationAction::Delete => {
+                let Some(confirmed) = confirmed else {
+                    return;
+                };
+                confirmed
             }
-            return;
+            ConfirmationAction::Ignore => {
+                if confirmed.is_some_and(|decision| !decision.spam) {
+                    tracing::info!(
+                        target: "processor",
+                        "isolated spam confirmation rejected the batch decision"
+                    );
+                }
+                return;
+            }
+            ConfirmationAction::Requeue => {
+                self.requeue_group(group);
+                return;
+            }
         };
-        let Some(confirmed) = confirmation.get("item_0") else {
-            self.requeue_group(group);
-            return;
-        };
-        if !confirmed.spam {
-            tracing::info!(
-                target: "processor",
-                "isolated spam confirmation rejected the batch decision"
-            );
-            return;
-        }
 
         let reason = sanitize_reason(confirmed.reason.as_deref().or(decision.reason.as_deref()));
         let mut evidence_sources = HashSet::new();
         for job in &group.jobs {
-            match self.delete_spam(job, &reason).await {
+            match self.moderation.delete_spam(job, &reason).await {
                 Ok(()) => {
                     if let Some(source_hash) =
                         MessageFingerprint::evidence_source_hash(job.chat_id.0, job.from_id)
@@ -555,7 +576,7 @@ impl MessageProcessor {
             normalizer_version: self.config.spam_cache.normalizer_version,
         };
         let result = self
-            .spam_cache
+            .decision_store
             .observe_spam(
                 fingerprint,
                 evidence_source_hash,
@@ -579,7 +600,7 @@ impl MessageProcessor {
 
         if decision.state == DecisionState::Active {
             if let Err(err) = self
-                .spam_cache
+                .decision_store
                 .put_decision(DecisionInput {
                     fingerprint,
                     state: DecisionState::Active,
@@ -642,93 +663,6 @@ impl MessageProcessor {
                 "failed to update processor heartbeat"
             );
         }
-    }
-
-    async fn delete_spam(&self, job: &MessageJob, reason: &str) -> Result<()> {
-        self.bot
-            .delete_message(job.chat_id, job.message_id)
-            .await
-            .with_context(|| format!("failed to delete message {}", job.message_id.0))?;
-
-        tracing::info!(
-            target: "processor",
-            chat_id = job.chat_id.0,
-            message_id = job.message_id.0,
-            priority = job.priority_score,
-            "spam message deleted"
-        );
-
-        if let Some(admin_group_id) = self.config.admin_group_id {
-            if admin_group_id != 0 {
-                let deleted_at = Utc::now();
-                let formatted = self.format_admin_log(job, deleted_at, Some(reason));
-                let mut request = self
-                    .bot
-                    .send_message(ChatId(admin_group_id), formatted)
-                    .parse_mode(ParseMode::Html);
-
-                if let Some(user_id) = job.from_id {
-                    let markup = teloxide::types::InlineKeyboardMarkup::new(vec![vec![
-                        teloxide::types::InlineKeyboardButton::callback(
-                            "유저 밴",
-                            format!("ban:{}:{}", job.chat_id.0, user_id),
-                        ),
-                    ]]);
-                    request = request.reply_markup(markup);
-                }
-
-                if let Err(err) = request.await {
-                    tracing::error!(
-                        target: "processor",
-                        error = %err,
-                        admin_group_id,
-                        chat_id = job.chat_id.0,
-                        message_id = job.message_id.0,
-                        "failed to send admin spam log"
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn format_admin_log(
-        &self,
-        job: &MessageJob,
-        deleted_at: DateTime<Utc>,
-        reason: Option<&str>,
-    ) -> String {
-        let tz: Tz = self
-            .config
-            .timezone
-            .parse()
-            .unwrap_or(chrono_tz::Asia::Seoul);
-        let sent_time = job.timestamp.with_timezone(&tz);
-        let deleted_time = deleted_at.with_timezone(&tz);
-        let user_id = job
-            .from_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        format!(
-            "<b>스팸 삭제 로그</b>\n\n\
-             채팅방: {}\n\
-             채팅방 ID: {}\n\
-             사용자: {}\n\
-             사용자 ID: {}\n\
-             메시지 전송 시각: {}\n\
-             삭제 완료 시각: {}\n\n\
-             스팸 메시지:\n<pre>{}</pre>\n\
-             삭제 사유:\n<pre>{}</pre>",
-            escape_html(job.chat_title.as_deref().unwrap_or("Unknown")),
-            job.chat_id.0,
-            escape_html(&job.from_display),
-            escape_html(&user_id),
-            sent_time.format("%Y-%m-%d %H:%M:%S"),
-            deleted_time.format("%Y-%m-%d %H:%M:%S"),
-            escape_html(&job.text),
-            escape_html(reason.unwrap_or(DEFAULT_REASON))
-        )
     }
 }
 
@@ -805,21 +739,6 @@ fn url_origin_for_log(raw: &str) -> String {
     }
 }
 
-fn escape_html(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
 fn sanitize_reason(reason: Option<&str>) -> String {
     let Some(reason) = reason else {
         return DEFAULT_REASON.to_string();
@@ -838,11 +757,335 @@ fn sanitize_reason(reason: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        net::IpAddr,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
-    use crate::domain::ClassificationDecision;
+    use anyhow::{anyhow, Result};
+    use chrono::Utc;
+    use futures::future::BoxFuture;
+    use parking_lot::Mutex;
+    use tempfile::TempDir;
 
-    use super::{classification_keys_match, url_for_prompt, url_origin_for_log};
+    use crate::{
+        application::ports::{
+            CachePolicy, CachedDecision, DecisionInput, DecisionState, DecisionVerdict,
+            FuzzySpamCandidate, MessageModerationGateway, SpamClassifier, SpamDecisionStore,
+            WebContentReader,
+        },
+        config::{
+            env::{LoggingConfig, ProcessorConfig, ResilienceConfig, SpamCacheConfig},
+            AppConfig, CerebrasConfig, DirectoryConfig, QueueConfig, WebContentConfig,
+        },
+        domain::{
+            ChatId, ClassificationDecision, ClassificationMap, MessageFingerprint, MessageId,
+            MessageJob, WebContent,
+        },
+        infrastructure::shutdown::Shutdown,
+        tasks::queue::MessageQueue,
+    };
+
+    use super::{classification_keys_match, url_for_prompt, url_origin_for_log, MessageProcessor};
+
+    struct FakeClassifier {
+        calls: AtomicUsize,
+        responses: Mutex<VecDeque<ClassificationMap>>,
+    }
+
+    impl SpamClassifier for FakeClassifier {
+        fn classify<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<ClassificationMap>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                self.responses
+                    .lock()
+                    .pop_front()
+                    .ok_or_else(|| anyhow!("missing fake classification"))
+            })
+        }
+    }
+
+    struct FakeDecisionStore {
+        exact_hit: bool,
+        evidence_writes: AtomicUsize,
+    }
+
+    impl SpamDecisionStore for FakeDecisionStore {
+        fn find_exact_batch<'a>(
+            &'a self,
+            text_hashes: &'a [String],
+            _: &'a str,
+            _: i64,
+        ) -> BoxFuture<'a, Result<HashMap<String, CachedDecision>>> {
+            Box::pin(async move {
+                if !self.exact_hit {
+                    return Ok(HashMap::new());
+                }
+                let Some(text_hash) = text_hashes.first() else {
+                    return Ok(HashMap::new());
+                };
+                Ok(HashMap::from([(
+                    text_hash.clone(),
+                    CachedDecision {
+                        id: 1,
+                        verdict: DecisionVerdict::Spam,
+                        state: DecisionState::Active,
+                        confidence: Some(1.0),
+                        evidence_count: 2,
+                        reason: Some("cached".to_string()),
+                        hit_count: 0,
+                        expires_at: i64::MAX,
+                    },
+                )]))
+            })
+        }
+
+        fn find_similar_candidates_batch<'a>(
+            &'a self,
+            _: &'a [MessageFingerprint],
+            _: f64,
+            _: i64,
+            _: &'a str,
+            _: i64,
+        ) -> BoxFuture<'a, Result<HashMap<String, FuzzySpamCandidate>>> {
+            Box::pin(async { Ok(HashMap::new()) })
+        }
+
+        fn put_decision<'a>(
+            &'a self,
+            _: DecisionInput<'a>,
+        ) -> BoxFuture<'a, Result<CachedDecision>> {
+            Box::pin(async { Err(anyhow!("unexpected active decision update")) })
+        }
+
+        fn observe_spam<'a>(
+            &'a self,
+            _: &'a MessageFingerprint,
+            _: &'a str,
+            _: &'a CachePolicy,
+            _: Option<f64>,
+            _: Option<&'a str>,
+            _: Duration,
+        ) -> BoxFuture<'a, Result<CachedDecision>> {
+            self.evidence_writes.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(CachedDecision {
+                    id: 1,
+                    verdict: DecisionVerdict::Spam,
+                    state: DecisionState::Tentative,
+                    confidence: None,
+                    evidence_count: 1,
+                    reason: None,
+                    hit_count: 0,
+                    expires_at: i64::MAX,
+                })
+            })
+        }
+
+        fn mark_hit(&self, _: i64) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn prune_expired_batch(&self, _: i64) -> BoxFuture<'_, Result<u64>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    struct FakeWebReader;
+
+    impl WebContentReader for FakeWebReader {
+        fn fetch<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Option<WebContent>>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    struct FakeModeration {
+        fail: bool,
+        deletions: AtomicUsize,
+    }
+
+    impl MessageModerationGateway for FakeModeration {
+        fn delete_spam<'a>(&'a self, _: &'a MessageJob, _: &'a str) -> BoxFuture<'a, Result<()>> {
+            self.deletions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if self.fail {
+                    Err(anyhow!("delete failed"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    struct ProcessorFixture {
+        processor: MessageProcessor,
+        classifier: Arc<FakeClassifier>,
+        store: Arc<FakeDecisionStore>,
+        moderation: Arc<FakeModeration>,
+        _temp_dir: TempDir,
+    }
+
+    fn fixture(
+        exact_hit: bool,
+        responses: Vec<ClassificationMap>,
+        deletion_fails: bool,
+    ) -> ProcessorFixture {
+        let config = Arc::new(test_config());
+        let queue = Arc::new(MessageQueue::new(config.queue.clone()));
+        let classifier = Arc::new(FakeClassifier {
+            calls: AtomicUsize::new(0),
+            responses: Mutex::new(responses.into()),
+        });
+        let store = Arc::new(FakeDecisionStore {
+            exact_hit,
+            evidence_writes: AtomicUsize::new(0),
+        });
+        let moderation = Arc::new(FakeModeration {
+            fail: deletion_fails,
+            deletions: AtomicUsize::new(0),
+        });
+        let temp_dir = tempfile::tempdir().expect("temporary processor directory");
+        let processor = MessageProcessor::new(
+            queue,
+            classifier.clone(),
+            Arc::new(FakeWebReader),
+            store.clone(),
+            moderation.clone(),
+            config,
+            temp_dir.path().join("heartbeat"),
+        );
+        ProcessorFixture {
+            processor,
+            classifier,
+            store,
+            moderation,
+            _temp_dir: temp_dir,
+        }
+    }
+
+    fn test_config() -> AppConfig {
+        AppConfig {
+            telegram_bot_token: "test".to_string(),
+            bot_username: None,
+            admin_user_id: None,
+            admin_group_id: None,
+            allowed_chat_ids: Vec::new(),
+            cerebras: CerebrasConfig {
+                api_key: "test".to_string(),
+                model: "test".to_string(),
+                request_timeout: Duration::from_secs(1),
+            },
+            directories: DirectoryConfig {
+                logs_dir: "logs".to_string(),
+                data_dir: "data".to_string(),
+                db_filename: "test.db".to_string(),
+            },
+            logging: LoggingConfig {
+                level: "info".to_string(),
+                file_enabled: false,
+            },
+            timezone: "Asia/Seoul".to_string(),
+            queue: QueueConfig {
+                max_messages: 10,
+                high_priority_max: 5,
+                normal_priority_max: 5,
+            },
+            processor: ProcessorConfig {
+                batch_max_messages: 10,
+                batch_max_chars: 10_000,
+                retry_attempts: 1,
+                max_requeues: 1,
+                retry_base_delay: Duration::ZERO,
+                web_fetch_concurrency: 1,
+            },
+            spam_cache: SpamCacheConfig {
+                similarity_threshold: 0.92,
+                scan_limit: 100,
+                min_normalized_chars: 1,
+                policy_version: "test".to_string(),
+                normalizer_version: 1,
+                tentative_ttl: Duration::from_secs(60),
+                confirmed_ttl: Duration::from_secs(60),
+                prune_interval: Duration::from_secs(60),
+            },
+            web: WebContentConfig {
+                max_urls_per_message: 1,
+                fetch_timeout: Duration::from_secs(1),
+                response_max_bytes: 1_024,
+                content_max_length: 1_024,
+                blocked_ips: Vec::<IpAddr>::new(),
+            },
+            resilience: ResilienceConfig {
+                network_error_threshold: 3,
+                network_error_window: Duration::from_secs(60),
+                restart_cooldown: Duration::from_secs(60),
+            },
+        }
+    }
+
+    fn test_job() -> MessageJob {
+        MessageJob {
+            chat_id: ChatId(-100),
+            chat_title: Some("group".to_string()),
+            message_id: MessageId(1),
+            from_id: Some(10),
+            from_display: "sender".to_string(),
+            text: "repeated spam message".to_string(),
+            urls: Vec::new(),
+            is_group_member: false,
+            priority_score: 10,
+            timestamp: Utc::now(),
+            requeue_count: 0,
+        }
+    }
+
+    fn spam_response() -> ClassificationMap {
+        HashMap::from([(
+            "item_0".to_string(),
+            ClassificationDecision {
+                spam: true,
+                reason: Some("spam".to_string()),
+            },
+        )])
+    }
+
+    #[tokio::test]
+    async fn cache_hit_does_not_call_classifier() {
+        let fixture = fixture(true, Vec::new(), false);
+        let (_shutdown_signal, mut shutdown) = Shutdown::new();
+
+        fixture
+            .processor
+            .handle_batch(vec![test_job()], &mut shutdown)
+            .await;
+
+        assert_eq!(fixture.classifier.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.moderation.deletions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn evidence_is_written_only_after_successful_deletion() {
+        let failed = fixture(false, vec![spam_response(), spam_response()], true);
+        let (_failed_signal, mut failed_shutdown) = Shutdown::new();
+        failed
+            .processor
+            .handle_batch(vec![test_job()], &mut failed_shutdown)
+            .await;
+        assert_eq!(failed.store.evidence_writes.load(Ordering::SeqCst), 0);
+
+        let succeeded = fixture(false, vec![spam_response(), spam_response()], false);
+        let (_succeeded_signal, mut succeeded_shutdown) = Shutdown::new();
+        succeeded
+            .processor
+            .handle_batch(vec![test_job()], &mut succeeded_shutdown)
+            .await;
+        assert_eq!(succeeded.store.evidence_writes.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn requires_every_requested_classification_key() {

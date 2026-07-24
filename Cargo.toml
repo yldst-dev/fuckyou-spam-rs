@@ -21,16 +21,12 @@ parking_lot = "0.12"
 futures = "0.3"
 reqwest = { version = "0.12.9", default-features = false, features = ["json", "stream", "gzip", "brotli", "deflate", "rustls-tls"] }
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "signal", "time", "fs"] }
-tokio-cron-scheduler = "0.10.0"
 teloxide = { version = "0.17.0", default-features = false, features = ["macros", "ctrlc_handler", "rustls"] }
 sqlx-core = { version = "0.9.0", default-features = false, features = ["_rt-tokio", "migrate"] }
 sqlx-sqlite = { version = "0.9.0", default-features = false, features = ["chrono", "bundled", "migrate"] }
 dom_smoothie = "0.14"
-semver = "1.0"
 sha2 = "0.10"
 unicode-normalization = "0.1"
-flate2 = "1.0"
-tar = "0.4"
 tempfile = "3.10"
 fs2 = "0.4"
 libc = "0.2"

@@ -7,119 +7,30 @@ use sqlx_core::{
 };
 use sqlx_sqlite::{Sqlite, SqlitePool, SqliteRow};
 
-use crate::domain::MessageFingerprint;
+use crate::{
+    application::ports::{
+        CachePolicy, CachedDecision, DecisionInput, DecisionState, DecisionVerdict,
+        FuzzySpamCandidate, SpamDecisionStore,
+    },
+    domain::MessageFingerprint,
+};
 
-pub const DEFAULT_POLICY_VERSION: &str = "spam-policy-v1";
-pub const DEFAULT_NORMALIZER_VERSION: i64 = 1;
-pub const DEFAULT_ACTIVATION_EVIDENCE: i64 = 2;
+pub(crate) const DEFAULT_ACTIVATION_EVIDENCE: i64 = 2;
 #[cfg(test)]
-pub const DEFAULT_PRUNE_LIMIT: i64 = 1_000;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CachePolicy {
-    pub policy_version: String,
-    pub normalizer_version: i64,
-}
-
-impl Default for CachePolicy {
-    fn default() -> Self {
-        Self {
-            policy_version: DEFAULT_POLICY_VERSION.to_string(),
-            normalizer_version: DEFAULT_NORMALIZER_VERSION,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecisionVerdict {
-    Spam,
-}
-
-impl TryFrom<&str> for DecisionVerdict {
-    type Error = anyhow::Error;
-
-    fn try_from(value: &str) -> Result<Self> {
-        match value {
-            "spam" => Ok(Self::Spam),
-            _ => Err(anyhow::anyhow!("invalid decision verdict: {value}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecisionState {
-    Tentative,
-    Active,
-    Revoked,
-}
-
-impl DecisionState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Tentative => "tentative",
-            Self::Active => "active",
-            Self::Revoked => "revoked",
-        }
-    }
-}
-
-impl TryFrom<&str> for DecisionState {
-    type Error = anyhow::Error;
-
-    fn try_from(value: &str) -> Result<Self> {
-        match value {
-            "tentative" => Ok(Self::Tentative),
-            "active" => Ok(Self::Active),
-            "revoked" => Ok(Self::Revoked),
-            _ => Err(anyhow::anyhow!("invalid decision state: {value}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DecisionInput<'a> {
-    pub fingerprint: &'a MessageFingerprint,
-    pub state: DecisionState,
-    pub confidence: Option<f64>,
-    pub policy: &'a CachePolicy,
-    pub evidence_count: i64,
-    pub reason: Option<&'a str>,
-    pub ttl: Duration,
-}
-
-#[derive(Debug, Clone)]
-pub struct CachedDecision {
-    pub id: i64,
-    pub verdict: DecisionVerdict,
-    pub state: DecisionState,
-    pub confidence: Option<f64>,
-    pub evidence_count: i64,
-    pub reason: Option<String>,
-    pub hit_count: i64,
-    pub expires_at: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct FuzzySpamCandidate {
-    pub id: i64,
-    pub reason: Option<String>,
-    pub score: f64,
-    pub confidence: Option<f64>,
-    pub evidence_count: i64,
-}
+pub(crate) const DEFAULT_PRUNE_LIMIT: i64 = 1_000;
 
 #[derive(Clone)]
-pub struct SpamCacheRepository {
+pub(crate) struct SpamCacheRepository {
     pool: SqlitePool,
 }
 
 impl SpamCacheRepository {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 
     #[cfg(test)]
-    pub async fn find_exact_decision(
+    pub(crate) async fn find_exact_decision(
         &self,
         fingerprint: &MessageFingerprint,
         policy: &CachePolicy,
@@ -156,7 +67,7 @@ impl SpamCacheRepository {
         .transpose()
     }
 
-    pub async fn find_exact_batch(
+    pub(crate) async fn find_exact_batch(
         &self,
         text_hashes: &[String],
         policy_version: &str,
@@ -247,7 +158,7 @@ impl SpamCacheRepository {
     }
 
     #[cfg(test)]
-    pub async fn find_fuzzy_candidates(
+    pub(crate) async fn find_fuzzy_candidates(
         &self,
         fingerprint: &MessageFingerprint,
         policy: &CachePolicy,
@@ -282,7 +193,7 @@ impl SpamCacheRepository {
         Ok(candidates)
     }
 
-    pub async fn find_similar_candidates_batch(
+    pub(crate) async fn find_similar_candidates_batch(
         &self,
         fingerprints: &[MessageFingerprint],
         threshold: f64,
@@ -334,7 +245,7 @@ impl SpamCacheRepository {
         Ok(matches)
     }
 
-    pub async fn put_decision(&self, input: DecisionInput<'_>) -> Result<CachedDecision> {
+    pub(crate) async fn put_decision(&self, input: DecisionInput<'_>) -> Result<CachedDecision> {
         if input.state != DecisionState::Active
             || input.evidence_count < DEFAULT_ACTIVATION_EVIDENCE
         {
@@ -381,7 +292,7 @@ impl SpamCacheRepository {
         CachedDecision::try_from(row)
     }
 
-    pub async fn observe_spam(
+    pub(crate) async fn observe_spam(
         &self,
         fingerprint: &MessageFingerprint,
         evidence_source_hash: &str,
@@ -540,7 +451,7 @@ impl SpamCacheRepository {
         CachedDecision::try_from(row)
     }
 
-    pub async fn mark_hit(&self, id: i64) -> Result<()> {
+    pub(crate) async fn mark_hit(&self, id: i64) -> Result<()> {
         query(
             r#"
             UPDATE message_decisions
@@ -559,11 +470,11 @@ impl SpamCacheRepository {
     }
 
     #[cfg(test)]
-    pub async fn prune_expired(&self) -> Result<u64> {
+    pub(crate) async fn prune_expired(&self) -> Result<u64> {
         self.prune_expired_batch(DEFAULT_PRUNE_LIMIT).await
     }
 
-    pub async fn prune_expired_batch(&self, limit: i64) -> Result<u64> {
+    pub(crate) async fn prune_expired_batch(&self, limit: i64) -> Result<u64> {
         let affected = query(
             r#"
             DELETE FROM message_decisions
@@ -581,6 +492,75 @@ impl SpamCacheRepository {
         .await?
         .rows_affected();
         Ok(affected)
+    }
+}
+
+impl SpamDecisionStore for SpamCacheRepository {
+    fn find_exact_batch<'a>(
+        &'a self,
+        text_hashes: &'a [String],
+        policy_version: &'a str,
+        normalizer_version: i64,
+    ) -> futures::future::BoxFuture<'a, Result<HashMap<String, CachedDecision>>> {
+        Box::pin(SpamCacheRepository::find_exact_batch(
+            self,
+            text_hashes,
+            policy_version,
+            normalizer_version,
+        ))
+    }
+
+    fn find_similar_candidates_batch<'a>(
+        &'a self,
+        fingerprints: &'a [MessageFingerprint],
+        threshold: f64,
+        scan_limit: i64,
+        policy_version: &'a str,
+        normalizer_version: i64,
+    ) -> futures::future::BoxFuture<'a, Result<HashMap<String, FuzzySpamCandidate>>> {
+        Box::pin(SpamCacheRepository::find_similar_candidates_batch(
+            self,
+            fingerprints,
+            threshold,
+            scan_limit,
+            policy_version,
+            normalizer_version,
+        ))
+    }
+
+    fn put_decision<'a>(
+        &'a self,
+        input: DecisionInput<'a>,
+    ) -> futures::future::BoxFuture<'a, Result<CachedDecision>> {
+        Box::pin(SpamCacheRepository::put_decision(self, input))
+    }
+
+    fn observe_spam<'a>(
+        &'a self,
+        fingerprint: &'a MessageFingerprint,
+        evidence_source_hash: &'a str,
+        policy: &'a CachePolicy,
+        confidence: Option<f64>,
+        reason: Option<&'a str>,
+        ttl: Duration,
+    ) -> futures::future::BoxFuture<'a, Result<CachedDecision>> {
+        Box::pin(SpamCacheRepository::observe_spam(
+            self,
+            fingerprint,
+            evidence_source_hash,
+            policy,
+            confidence,
+            reason,
+            ttl,
+        ))
+    }
+
+    fn mark_hit(&self, id: i64) -> futures::future::BoxFuture<'_, Result<()>> {
+        Box::pin(SpamCacheRepository::mark_hit(self, id))
+    }
+
+    fn prune_expired_batch(&self, limit: i64) -> futures::future::BoxFuture<'_, Result<u64>> {
+        Box::pin(SpamCacheRepository::prune_expired_batch(self, limit))
     }
 }
 

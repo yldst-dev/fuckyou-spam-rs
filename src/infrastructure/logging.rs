@@ -9,7 +9,7 @@ use crate::{config::AppConfig, infrastructure::directories::ResolvedPaths};
 static INIT: OnceCell<()> = OnceCell::new();
 static GUARD: OnceCell<tracing_appender::non_blocking::WorkerGuard> = OnceCell::new();
 
-pub fn init_tracing(config: &AppConfig, paths: &ResolvedPaths) -> Result<()> {
+pub(crate) fn init_tracing(config: &AppConfig, paths: &ResolvedPaths) -> Result<()> {
     INIT.get_or_try_init::<_, anyhow::Error>(|| {
         let env_filter = EnvFilter::try_from_default_env()
             .or_else(|_| EnvFilter::try_new(&config.logging.level))

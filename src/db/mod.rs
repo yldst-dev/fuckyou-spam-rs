@@ -9,8 +9,8 @@ use sqlx_sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
 
-pub mod spam_cache;
-pub mod whitelist;
+pub(crate) mod spam_cache;
+pub(crate) mod whitelist;
 
 static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| Migrator {
     migrations: Cow::Owned(vec![
@@ -39,7 +39,7 @@ static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| Migrator {
     ..Migrator::DEFAULT
 });
 
-pub async fn init_pool(db_path: &Path) -> Result<SqlitePool> {
+pub(crate) async fn init_pool(db_path: &Path) -> Result<SqlitePool> {
     prepare_database_file(db_path)?;
     let options = SqliteConnectOptions::new()
         .filename(db_path)

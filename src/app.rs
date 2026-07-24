@@ -1,34 +1,28 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
-use chrono::Utc;
-use chrono_tz::Tz;
 use reqwest::Client;
 use teloxide::prelude::*;
 use tokio::{task::JoinHandle, time::timeout};
-use tokio_cron_scheduler::JobScheduler;
 
 use crate::{
     ai::CerebrasClient,
     config::AppConfig,
     db::{self, spam_cache::SpamCacheRepository, whitelist::WhitelistRepository},
-    domain::{MessageJob, QueueSnapshot},
+    domain::MessageJob,
     infrastructure::{
-        directories::ResolvedPaths, notifier::notify_admin_group, shutdown::Shutdown,
+        directories::ResolvedPaths,
+        notifier::notify_admin_group,
+        shutdown::{RestartCallback, Shutdown},
     },
-    tasks::{
-        processor::MessageProcessor,
-        queue::MessageQueue,
-        scheduler::{configure_restart_jobs, RestartCallback},
-    },
-    telegram::TelegramService,
+    tasks::{processor::MessageProcessor, queue::MessageQueue},
+    telegram::{TelegramMessageModerationGateway, TelegramService},
     web_content::WebContentFetcher,
 };
 
-pub struct SpamGuardApp {
-    _paths: ResolvedPaths,
-    scheduler: JobScheduler,
+pub(crate) struct SpamGuardApp {
     processor_handle: JoinHandle<Result<()>>,
+    health_monitor_handle: JoinHandle<Result<()>>,
     telegram: TelegramService,
     whitelist: Arc<WhitelistRepository>,
     shutdown: Shutdown,
@@ -37,7 +31,7 @@ pub struct SpamGuardApp {
 }
 
 impl SpamGuardApp {
-    pub async fn initialize(
+    pub(crate) async fn initialize(
         config: AppConfig,
         paths: ResolvedPaths,
         shutdown: Shutdown,
@@ -56,41 +50,39 @@ impl SpamGuardApp {
         let web_fetcher = Arc::new(WebContentFetcher::new(config.web.clone())?);
 
         let bot = Bot::new(&config.telegram_bot_token);
+        let moderation = Arc::new(TelegramMessageModerationGateway::new(
+            bot.clone(),
+            config.clone(),
+        ));
         let queue = Arc::new(MessageQueue::<MessageJob>::new(config.queue.clone()));
-        let queue_snapshot_provider: Arc<dyn Fn() -> QueueSnapshot + Send + Sync> = {
-            let queue = queue.clone();
-            Arc::new(move || queue.snapshot())
-        };
 
-        let restart_callback =
-            build_restart_callback(bot.clone(), config.clone(), shutdown.clone());
+        let restart_callback = build_restart_callback(shutdown.clone());
         let telegram = TelegramService::new(
             bot.clone(),
             config.clone(),
             whitelist.clone(),
             queue.clone(),
-            queue_snapshot_provider,
             restart_callback.clone(),
+            paths.data_dir.join("emergency-restart.timestamp"),
         );
 
+        let heartbeat_path = crate::infrastructure::health::heartbeat_path(&paths);
         let processor = Arc::new(MessageProcessor::new(
             queue,
-            bot.clone(),
             cerebras,
             web_fetcher,
             spam_cache,
+            moderation,
             config.clone(),
-            crate::infrastructure::health::heartbeat_path(&paths),
+            heartbeat_path.clone(),
         ));
         let processor_handle = processor.clone().spawn(shutdown.subscribe());
-
-        let scheduler =
-            configure_restart_jobs(&config.scheduler.cron_specs, restart_callback).await?;
+        let health_monitor_handle =
+            crate::infrastructure::health::spawn_monitor(heartbeat_path, shutdown.subscribe());
 
         Ok(Self {
-            _paths: paths,
-            scheduler,
             processor_handle,
+            health_monitor_handle,
             telegram,
             whitelist,
             shutdown,
@@ -99,11 +91,10 @@ impl SpamGuardApp {
         })
     }
 
-    pub async fn run(self) -> Result<()> {
+    pub(crate) async fn run(self) -> Result<()> {
         let SpamGuardApp {
-            _paths: _,
-            mut scheduler,
             mut processor_handle,
+            mut health_monitor_handle,
             telegram,
             whitelist,
             shutdown,
@@ -113,13 +104,18 @@ impl SpamGuardApp {
 
         tracing::info!("텔레그램 스팸 감지 봇 (Rust) 시작");
 
-        notify_admin_group(&bot, config.as_ref(), "스팸 감지 봇이 시작되었습니다.").await;
+        let _ = timeout(
+            Duration::from_secs(3),
+            notify_admin_group(&bot, config.as_ref(), "스팸 감지 봇이 시작되었습니다."),
+        )
+        .await;
 
         let mut shutdown_listener = shutdown.subscribe();
         let shutdown_timeout = Duration::from_secs(15);
         let mut telegram_future = Box::pin(telegram.run(shutdown.subscribe()));
         let mut telegram_completed = false;
         let mut processor_completed = false;
+        let mut health_monitor_completed = false;
         let mut runtime_error = None;
 
         tokio::select! {
@@ -131,6 +127,8 @@ impl SpamGuardApp {
                 if let Err(err) = res {
                     tracing::error!(?err, "Telegram dispatcher 종료 중 오류");
                     runtime_error = Some(anyhow!("Telegram dispatcher failed: {err}"));
+                } else if shutdown.is_triggered() {
+                    tracing::info!("Telegram dispatcher 정상 종료");
                 } else {
                     tracing::info!("Telegram dispatcher 정상 종료");
                     runtime_error = Some(anyhow!("Telegram dispatcher stopped unexpectedly"));
@@ -138,17 +136,39 @@ impl SpamGuardApp {
             }
             res = &mut processor_handle => {
                 processor_completed = true;
-                let error = match res {
-                    Ok(Ok(())) => anyhow!("message processor stopped unexpectedly"),
-                    Ok(Err(err)) => anyhow!("message processor failed: {err}"),
-                    Err(err) => anyhow!("message processor task failed: {err}"),
-                };
-                tracing::error!(
-                    target: "processor",
-                    error = %error,
-                    "message processor stopped while the application was running"
-                );
-                runtime_error = Some(error);
+                if matches!(&res, Ok(Ok(()))) && shutdown.is_triggered() {
+                    tracing::info!(target: "processor", "message processor stopped");
+                } else {
+                    let error = match res {
+                        Ok(Ok(())) => anyhow!("message processor stopped unexpectedly"),
+                        Ok(Err(err)) => anyhow!("message processor failed: {err}"),
+                        Err(err) => anyhow!("message processor task failed: {err}"),
+                    };
+                    tracing::error!(
+                        target: "processor",
+                        error = %error,
+                        "message processor stopped while the application was running"
+                    );
+                    runtime_error = Some(error);
+                }
+            }
+            res = &mut health_monitor_handle => {
+                health_monitor_completed = true;
+                if matches!(&res, Ok(Ok(()))) && shutdown.is_triggered() {
+                    tracing::info!(target: "health", "health monitor stopped");
+                } else {
+                    let error = match res {
+                        Ok(Ok(())) => anyhow!("health monitor stopped unexpectedly"),
+                        Ok(Err(err)) => anyhow!("health monitor failed: {err}"),
+                        Err(err) => anyhow!("health monitor task failed: {err}"),
+                    };
+                    tracing::error!(
+                        target: "health",
+                        error = %error,
+                        "health monitor stopped while the application was running"
+                    );
+                    runtime_error = Some(error);
+                }
             }
         }
 
@@ -170,20 +190,6 @@ impl SpamGuardApp {
                         shutdown_timeout
                     );
                 }
-            }
-        }
-
-        match timeout(shutdown_timeout, scheduler.shutdown()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                tracing::error!(?err, "스케줄러 종료 실패");
-            }
-            Err(_) => {
-                tracing::warn!(
-                    target: "scheduler",
-                    "스케줄러 종료가 {:?} 내에 완료되지 않았습니다.",
-                    shutdown_timeout
-                );
             }
         }
 
@@ -213,6 +219,21 @@ impl SpamGuardApp {
             }
         }
 
+        if !health_monitor_completed {
+            match timeout(shutdown_timeout, &mut health_monitor_handle).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(err))) => {
+                    tracing::error!(target: "health", error = %err, "health monitor shutdown failed");
+                }
+                Ok(Err(err)) => {
+                    tracing::error!(target: "health", error = %err, "health monitor task join failed");
+                }
+                Err(_) => {
+                    health_monitor_handle.abort();
+                }
+            }
+        }
+
         if timeout(shutdown_timeout, whitelist.close()).await.is_err() {
             tracing::warn!(
                 target: "db",
@@ -222,7 +243,11 @@ impl SpamGuardApp {
         }
 
         tracing::info!("봇 종료 완료");
-        notify_admin_group(&bot, config.as_ref(), "스팸 감지 봇이 종료되었습니다.").await;
+        let _ = timeout(
+            Duration::from_secs(3),
+            notify_admin_group(&bot, config.as_ref(), "스팸 감지 봇이 종료되었습니다."),
+        )
+        .await;
         if let Some(error) = runtime_error {
             Err(error)
         } else {
@@ -231,17 +256,6 @@ impl SpamGuardApp {
     }
 }
 
-fn build_restart_callback(bot: Bot, config: Arc<AppConfig>, shutdown: Shutdown) -> RestartCallback {
-    Arc::new(move || {
-        let bot = bot.clone();
-        let config = config.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            let tz: Tz = config.timezone.parse().unwrap_or(chrono_tz::Asia::Seoul);
-            let ts = Utc::now().with_timezone(&tz).format("%Y-%m-%d %H:%M:%S");
-            let message = format!("자동 재부팅을 시작합니다.\n현재 시각: {ts}");
-            notify_admin_group(&bot, config.as_ref(), &message).await;
-            shutdown.trigger();
-        });
-    })
+fn build_restart_callback(shutdown: Shutdown) -> RestartCallback {
+    Arc::new(move || shutdown.trigger())
 }

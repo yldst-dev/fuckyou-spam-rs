@@ -1,5 +1,5 @@
-pub mod env;
+pub(crate) mod env;
 mod loader;
 
-pub use env::{AppConfig, CerebrasConfig, DirectoryConfig, QueueConfig, WebContentConfig};
-pub use loader::load_config;
+pub(crate) use env::{AppConfig, CerebrasConfig, DirectoryConfig, QueueConfig, WebContentConfig};
+pub(crate) use loader::load_config;

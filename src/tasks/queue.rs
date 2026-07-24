@@ -3,31 +3,25 @@ use std::collections::VecDeque;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-use crate::{config::QueueConfig, domain::types::QueueSnapshot};
+use crate::{
+    application::ports::{MessageSubmissionOutcome, MessageSubmissionQueue},
+    config::QueueConfig,
+    domain::{MessageJob, QueueSnapshot},
+};
+
+pub(crate) use crate::application::ports::{
+    MessagePriority as Priority, MessageSubmissionOutcome as QueuePushOutcome,
+};
 
 #[derive(Debug, Clone, Copy)]
-pub enum Priority {
-    High,
-    Normal,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct QueueLimits {
+pub(crate) struct QueueLimits {
     max_messages: usize,
     high_priority_max: usize,
     normal_priority_max: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-#[must_use]
-pub enum QueuePushOutcome {
-    Enqueued,
-    DroppedNew,
-    DroppedOldestNormal,
-}
-
 #[derive(Debug)]
-pub struct MessageQueue<T> {
+pub(crate) struct MessageQueue<T> {
     high: Mutex<VecDeque<T>>,
     normal: Mutex<VecDeque<T>>,
     limits: QueueLimits,
@@ -35,7 +29,7 @@ pub struct MessageQueue<T> {
 }
 
 impl<T> MessageQueue<T> {
-    pub fn new(config: QueueConfig) -> Self {
+    pub(crate) fn new(config: QueueConfig) -> Self {
         Self {
             high: Mutex::new(VecDeque::new()),
             normal: Mutex::new(VecDeque::new()),
@@ -44,7 +38,7 @@ impl<T> MessageQueue<T> {
         }
     }
 
-    pub fn push(&self, priority: Priority, value: T) -> QueuePushOutcome {
+    pub(crate) fn push(&self, priority: Priority, value: T) -> QueuePushOutcome {
         let mut high = self.high.lock();
         let mut normal = self.normal.lock();
         let current_total = high.len() + normal.len();
@@ -108,11 +102,11 @@ impl<T> MessageQueue<T> {
     }
 
     #[cfg(test)]
-    pub fn drain_ordered(&self) -> Vec<T> {
+    pub(crate) fn drain_ordered(&self) -> Vec<T> {
         self.drain_ordered_limit(usize::MAX)
     }
 
-    pub fn drain_ordered_limit(&self, max_items: usize) -> Vec<T> {
+    pub(crate) fn drain_ordered_limit(&self, max_items: usize) -> Vec<T> {
         let mut drained = Vec::with_capacity(max_items.min(self.limits.max_messages));
         if max_items == 0 {
             return drained;
@@ -126,7 +120,7 @@ impl<T> MessageQueue<T> {
         drained
     }
 
-    pub async fn wait_for_items(&self) {
+    pub(crate) async fn wait_for_items(&self) {
         loop {
             let notified = self.notify.notified();
             if !self.is_empty() {
@@ -136,7 +130,7 @@ impl<T> MessageQueue<T> {
         }
     }
 
-    pub fn snapshot(&self) -> QueueSnapshot {
+    pub(crate) fn snapshot(&self) -> QueueSnapshot {
         let high = self.high.lock();
         let normal = self.normal.lock();
         QueueSnapshot {
@@ -149,6 +143,16 @@ impl<T> MessageQueue<T> {
         let high = self.high.lock();
         let normal = self.normal.lock();
         high.is_empty() && normal.is_empty()
+    }
+}
+
+impl MessageSubmissionQueue for MessageQueue<MessageJob> {
+    fn submit(&self, priority: Priority, job: MessageJob) -> MessageSubmissionOutcome {
+        self.push(priority, job)
+    }
+
+    fn snapshot(&self) -> QueueSnapshot {
+        MessageQueue::snapshot(self)
     }
 }
 

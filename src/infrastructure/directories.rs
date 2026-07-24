@@ -8,13 +8,13 @@ use anyhow::{anyhow, Context, Result};
 use crate::config::DirectoryConfig;
 
 #[derive(Debug, Clone)]
-pub struct ResolvedPaths {
+pub(crate) struct ResolvedPaths {
     pub logs_dir: PathBuf,
     pub data_dir: PathBuf,
     pub db_path: PathBuf,
 }
 
-pub fn ensure_directories(cfg: &DirectoryConfig) -> Result<ResolvedPaths> {
+pub(crate) fn ensure_directories(cfg: &DirectoryConfig) -> Result<ResolvedPaths> {
     let logs_dir = ensure_dir(&cfg.logs_dir)?;
     let data_dir = ensure_dir(&cfg.data_dir)?;
     validate_db_filename(&cfg.db_filename)?;

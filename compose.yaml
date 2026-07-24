@@ -8,11 +8,9 @@ services:
     env_file:
       - .env
     environment:
-      AUTO_UPDATE_ENABLED: "false"
       DATA_DIR: /app/data
       LOG_TO_FILE: "false"
       LOGS_DIR: /tmp/logs
-      RESTART_CRONS: ""
       WEBPAGE_BLOCKED_IPS: "${WEBPAGE_BLOCKED_IPS:-}"
     read_only: true
     cpus: "1.0"

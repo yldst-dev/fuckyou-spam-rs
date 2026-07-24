@@ -1,3 +1,6 @@
 /target
+/.claude/
+/data/
+/logs/
 /.env
 .DS_Store

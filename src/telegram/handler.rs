@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Result;
 use futures::future::BoxFuture;
@@ -11,35 +15,36 @@ use teloxide::{
     update_listeners,
     utils::command::BotCommands,
 };
-use tokio::time::{Duration, Instant};
+use tokio::time::{timeout, Duration, Instant};
 
 use crate::{
+    application::ports::{MessageSubmissionQueue, WhitelistEntry, WhitelistGateway},
     config::AppConfig,
-    db::whitelist::{WhitelistEntry, WhitelistRepository},
-    domain::MessageJob,
-    infrastructure::{notifier::notify_admin_group, shutdown::ShutdownListener},
-    tasks::{
-        queue::{MessageQueue, QueuePushOutcome},
-        scheduler::RestartCallback,
+    domain::{ChatId as DomainChatId, MessageId as DomainMessageId, MessageJob},
+    infrastructure::{
+        notifier::notify_admin_group,
+        shutdown::{RestartCallback, ShutdownListener},
     },
+    tasks::queue::QueuePushOutcome,
 };
 
 use super::{
-    types::{AppState, BotResult, GeneralCommand, MessageRateLimitOutcome, QueueSnapshotProvider},
+    types::{AppState, BotResult, GeneralCommand, MessageRateLimitOutcome},
     utils::{admin_command_list, calc_priority, extract_urls, format_user_display, user_to_i64},
 };
 
-pub struct TelegramService {
+pub(crate) struct TelegramService {
     bot: Bot,
     state: Arc<AppState>,
     restart_callback: RestartCallback,
+    restart_marker: PathBuf,
 }
 
 #[derive(Default)]
 struct WatchdogState {
     first_error_at: Option<Instant>,
     consecutive_errors: u32,
-    last_restart_at: Option<Instant>,
+    restart_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -69,15 +74,22 @@ struct UpdateListenerWatchdog {
     bot: Bot,
     config: Arc<AppConfig>,
     restart_callback: RestartCallback,
+    restart_marker: PathBuf,
     state: Mutex<WatchdogState>,
 }
 
 impl UpdateListenerWatchdog {
-    fn new(bot: Bot, config: Arc<AppConfig>, restart_callback: RestartCallback) -> Arc<Self> {
+    fn new(
+        bot: Bot,
+        config: Arc<AppConfig>,
+        restart_callback: RestartCallback,
+        restart_marker: PathBuf,
+    ) -> Arc<Self> {
         Arc::new(Self {
             bot,
             config,
             restart_callback,
+            restart_marker,
             state: Mutex::new(WatchdogState::default()),
         })
     }
@@ -146,23 +158,13 @@ impl UpdateListenerWatchdog {
                 "Telegram polling network failure"
             );
 
-            if consecutive >= self.config.resilience.network_error_threshold {
-                if state
-                    .last_restart_at
-                    .map(|ts| now.duration_since(ts) < self.config.resilience.restart_cooldown)
-                    .unwrap_or(false)
-                {
-                    tracing::warn!(
-                        target: "telegram",
-                        cooldown_secs = self.config.resilience.restart_cooldown.as_secs(),
-                        "Emergency restart skipped due to cooldown"
-                    );
-                } else {
-                    state.last_restart_at = Some(now);
-                    state.first_error_at = None;
-                    state.consecutive_errors = 0;
-                    restart_decision = Some((consecutive, elapsed));
-                }
+            if consecutive >= self.config.resilience.network_error_threshold
+                && !state.restart_pending
+            {
+                state.restart_pending = true;
+                state.first_error_at = None;
+                state.consecutive_errors = 0;
+                restart_decision = Some((consecutive, elapsed));
             }
         }
 
@@ -177,10 +179,46 @@ impl UpdateListenerWatchdog {
             "Triggered emergency restart after repeated network failures"
         );
 
-        let summary = self.build_summary(&info, &error, consecutive, elapsed);
-        notify_admin_group(&self.bot, self.config.as_ref(), &summary).await;
+        if !self.claim_restart_cooldown().await {
+            self.state.lock().restart_pending = false;
+            tracing::warn!(
+                target: "telegram",
+                cooldown_secs = self.config.resilience.restart_cooldown.as_secs(),
+                "Emergency restart skipped due to persistent cooldown"
+            );
+            return;
+        }
 
         (self.restart_callback)();
+        let summary = self.build_summary(&info, &error, consecutive, elapsed);
+        let _ = timeout(
+            Duration::from_secs(3),
+            notify_admin_group(&self.bot, self.config.as_ref(), &summary),
+        )
+        .await;
+    }
+
+    async fn claim_restart_cooldown(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last_restart = tokio::fs::read_to_string(&self.restart_marker)
+            .await
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        if !restart_cooldown_elapsed(last_restart, now, self.config.resilience.restart_cooldown) {
+            return false;
+        }
+        if let Err(err) = tokio::fs::write(&self.restart_marker, now.to_string()).await {
+            tracing::warn!(
+                target: "telegram",
+                error = %err,
+                marker = %self.restart_marker.display(),
+                "Failed to persist emergency restart cooldown"
+            );
+        }
+        true
     }
 
     fn build_summary(
@@ -214,23 +252,24 @@ impl ErrorHandler<teloxide::RequestError> for UpdateListenerWatchdog {
 }
 
 impl TelegramService {
-    pub fn new(
+    pub(crate) fn new(
         bot: Bot,
         config: Arc<AppConfig>,
-        whitelist: Arc<WhitelistRepository>,
-        queue: Arc<MessageQueue<MessageJob>>,
-        queue_snapshot: QueueSnapshotProvider,
+        whitelist: Arc<dyn WhitelistGateway>,
+        submission_queue: Arc<dyn MessageSubmissionQueue>,
         restart_callback: RestartCallback,
+        restart_marker: PathBuf,
     ) -> Self {
-        let state = Arc::new(AppState::new(config, whitelist, queue, queue_snapshot));
+        let state = Arc::new(AppState::new(config, whitelist, submission_queue));
         Self {
             bot,
             state,
             restart_callback,
+            restart_marker,
         }
     }
 
-    pub async fn run(&self, mut shutdown: ShutdownListener) -> Result<()> {
+    pub(crate) async fn run(&self, mut shutdown: ShutdownListener) -> Result<()> {
         self.sync_commands().await?;
         let me = self.bot.get_me().await?;
         if let Some(expected_username) = &self.state.config.bot_username {
@@ -284,6 +323,7 @@ impl TelegramService {
             self.bot.clone(),
             self.state.config.clone(),
             self.restart_callback.clone(),
+            self.restart_marker.clone(),
         );
 
         let shutdown_token = dispatcher.shutdown_token();
@@ -352,9 +392,9 @@ impl TelegramService {
         let (priority, priority_score) = calc_priority(&text, is_group_member);
         let urls = extract_urls(&text, state.config.web.max_urls_per_message);
         let job = MessageJob {
-            chat_id: msg.chat.id,
+            chat_id: DomainChatId(msg.chat.id.0),
             chat_title: msg.chat.title().map(|t| t.to_string()),
-            message_id: msg.id,
+            message_id: DomainMessageId(msg.id.0),
             from_id,
             from_display,
             text,
@@ -367,7 +407,7 @@ impl TelegramService {
 
         let chat_id = job.chat_id.0;
         let message_id = job.message_id.0;
-        match state.queue.push(priority, job) {
+        match state.submission_queue.submit(priority, job) {
             QueuePushOutcome::Enqueued => {
                 tracing::debug!(
                     target: "queue",
@@ -430,7 +470,7 @@ impl TelegramService {
                     .await?
             }
             GeneralCommand::Status => {
-                let snapshot = (state.queue_snapshot)();
+                let snapshot = state.submission_queue.snapshot();
                 bot.send_message(
                     msg.chat.id,
                     format!(
@@ -798,5 +838,41 @@ impl TelegramService {
         }
         tracing::info!(target: "telegram", "명령어 동기화 완료");
         Ok(())
+    }
+}
+
+fn restart_cooldown_elapsed(
+    last_restart: Option<u64>,
+    now: u64,
+    cooldown: std::time::Duration,
+) -> bool {
+    last_restart
+        .map(|last| now.saturating_sub(last) >= cooldown.as_secs())
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::restart_cooldown_elapsed;
+
+    #[test]
+    fn restart_cooldown_survives_process_restarts() {
+        assert!(!restart_cooldown_elapsed(
+            Some(1_000),
+            1_599,
+            Duration::from_secs(600)
+        ));
+        assert!(restart_cooldown_elapsed(
+            Some(1_000),
+            1_600,
+            Duration::from_secs(600)
+        ));
+        assert!(restart_cooldown_elapsed(
+            None,
+            1_000,
+            Duration::from_secs(600)
+        ));
     }
 }
