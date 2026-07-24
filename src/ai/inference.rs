@@ -1,9 +1,11 @@
+use std::collections::HashMap;
+
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::types::ClassificationMap;
+use crate::domain::{ClassificationDecision, ClassificationMap};
 
 pub(crate) const CEREBRAS_API_URL: &str = "https://api.cerebras.ai/v1/chat/completions";
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
@@ -87,8 +89,27 @@ pub(crate) async fn parse_response(response: Response) -> Result<ClassificationM
         .and_then(|msg| msg.content)
         .context("Cerebras response missing message content")?;
 
-    let classification: ClassificationMap = serde_json::from_str(&content)?;
-    Ok(classification)
+    let decisions: HashMap<String, ClassificationDecisionDto> = serde_json::from_str(&content)?;
+    Ok(decisions
+        .into_iter()
+        .map(|(item_id, decision)| (item_id, decision.into()))
+        .collect::<ClassificationMap>())
+}
+
+#[derive(Debug, Deserialize)]
+struct ClassificationDecisionDto {
+    spam: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+impl From<ClassificationDecisionDto> for ClassificationDecision {
+    fn from(dto: ClassificationDecisionDto) -> Self {
+        Self {
+            spam: dto.spam,
+            reason: dto.reason,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

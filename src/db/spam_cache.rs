@@ -1,21 +1,26 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use anyhow::{bail, Result};
 use sqlx_core::{
     from_row::FromRow, query::query, query_as::query_as, query_builder::QueryBuilder,
-    query_scalar::query_scalar, row::Row,
+    query_scalar::query_scalar, row::Row, transaction::Transaction,
 };
 use sqlx_sqlite::{Sqlite, SqlitePool, SqliteRow};
 
 use crate::{
-    application::ports::{
-        CachePolicy, CachedDecision, DecisionInput, DecisionState, DecisionVerdict,
-        FuzzySpamCandidate, SpamDecisionStore,
+    application::{
+        decision_policy::{activation_state, ACTIVATION_EVIDENCE_THRESHOLD},
+        ports::{
+            CachePolicy, CachedDecision, DecisionInput, DecisionState, DecisionVerdict,
+            FuzzySpamCandidate, SpamDecisionStore,
+        },
     },
     domain::MessageFingerprint,
 };
 
-pub(crate) const DEFAULT_ACTIVATION_EVIDENCE: i64 = 2;
 #[cfg(test)]
 pub(crate) const DEFAULT_PRUNE_LIMIT: i64 = 1_000;
 
@@ -27,44 +32,6 @@ pub(crate) struct SpamCacheRepository {
 impl SpamCacheRepository {
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn find_exact_decision(
-        &self,
-        fingerprint: &MessageFingerprint,
-        policy: &CachePolicy,
-    ) -> Result<Option<CachedDecision>> {
-        query_as::<_, CachedDecisionRow>(
-            r#"
-            SELECT
-                id,
-                verdict,
-                state,
-                confidence,
-                evidence_count,
-                reason,
-                hit_count,
-                expires_at
-            FROM message_decisions
-            WHERE text_hash = ?1
-              AND chat_scope_hash = ?2
-              AND policy_version = ?3
-              AND normalizer_version = ?4
-              AND verdict = 'spam'
-              AND state = 'active'
-              AND evidence_count >= 2
-              AND expires_at > unixepoch()
-            "#,
-        )
-        .bind(&fingerprint.text_hash)
-        .bind(&fingerprint.chat_scope_hash)
-        .bind(&policy.policy_version)
-        .bind(policy.normalizer_version)
-        .fetch_optional(&self.pool)
-        .await?
-        .map(CachedDecision::try_from)
-        .transpose()
     }
 
     pub(crate) async fn find_exact_batch(
@@ -98,9 +65,9 @@ impl SpamCacheRepository {
                 .push_bind(policy_version)
                 .push(" AND normalizer_version = ")
                 .push_bind(normalizer_version)
-                .push(
-                    " AND verdict = 'spam' AND state = 'active' AND evidence_count >= 2 AND expires_at > unixepoch() AND text_hash IN (",
-                );
+                .push(" AND verdict = 'spam' AND state = 'active' AND evidence_count >= ")
+                .push_bind(ACTIVATION_EVIDENCE_THRESHOLD)
+                .push(" AND expires_at > unixepoch() AND text_hash IN (");
             let mut separated = builder.separated(", ");
             for text_hash in chunk {
                 separated.push_bind(text_hash);
@@ -116,6 +83,78 @@ impl SpamCacheRepository {
             }
         }
         Ok(decisions)
+    }
+
+    pub(crate) async fn find_ham_batch(
+        &self,
+        text_hashes: &[String],
+        policy: &CachePolicy,
+    ) -> Result<HashSet<String>> {
+        if text_hashes.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut hits = HashSet::with_capacity(text_hashes.len());
+        for chunk in text_hashes.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                r#"
+                SELECT text_hash
+                FROM message_ham_decisions
+                WHERE policy_version =
+                "#,
+            );
+            builder
+                .push_bind(&policy.policy_version)
+                .push(" AND normalizer_version = ")
+                .push_bind(policy.normalizer_version)
+                .push(" AND expires_at > unixepoch() AND text_hash IN (");
+            let mut separated = builder.separated(", ");
+            for text_hash in chunk {
+                separated.push_bind(text_hash);
+            }
+            separated.push_unseparated(")");
+            let rows = builder
+                .build_query_scalar::<String>()
+                .fetch_all(&self.pool)
+                .await?;
+            hits.extend(rows);
+        }
+        Ok(hits)
+    }
+
+    pub(crate) async fn record_ham(
+        &self,
+        fingerprint: &MessageFingerprint,
+        policy: &CachePolicy,
+        ttl: Duration,
+    ) -> Result<()> {
+        query(
+            r#"
+            INSERT INTO message_ham_decisions (
+                text_hash,
+                policy_version,
+                normalizer_version,
+                hit_count,
+                created_at,
+                last_seen_at,
+                expires_at
+            )
+            VALUES (?1, ?2, ?3, 0, unixepoch(), unixepoch(), unixepoch() + ?4)
+            ON CONFLICT(text_hash, policy_version, normalizer_version) DO UPDATE SET
+                hit_count = hit_count + 1,
+                last_seen_at = unixepoch(),
+                expires_at = unixepoch() + ?4
+            "#,
+        )
+        .bind(&fingerprint.text_hash)
+        .bind(&policy.policy_version)
+        .bind(policy.normalizer_version)
+        .bind(ttl_seconds(ttl))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn load_fuzzy_rows(
@@ -136,7 +175,7 @@ impl SpamCacheRepository {
             FROM message_decisions
             WHERE verdict = 'spam'
               AND state = 'active'
-              AND evidence_count >= 2
+              AND evidence_count >= ?5
               AND expires_at > unixepoch()
               AND policy_version = ?1
               AND normalizer_version = ?2
@@ -144,53 +183,18 @@ impl SpamCacheRepository {
               AND text_hash <> ?4
               AND similarity_hash IS NOT NULL
             ORDER BY last_seen_at DESC, id DESC
-            LIMIT ?5
+            LIMIT ?6
             "#,
         )
         .bind(&policy.policy_version)
         .bind(policy.normalizer_version)
         .bind(chat_scope_hash)
         .bind(excluded_hash)
+        .bind(ACTIVATION_EVIDENCE_THRESHOLD)
         .bind(scan_limit.max(1))
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn find_fuzzy_candidates(
-        &self,
-        fingerprint: &MessageFingerprint,
-        policy: &CachePolicy,
-        threshold: f64,
-        scan_limit: i64,
-        result_limit: usize,
-    ) -> Result<Vec<FuzzySpamCandidate>> {
-        let rows = self
-            .load_fuzzy_rows(
-                policy,
-                &fingerprint.chat_scope_hash,
-                &fingerprint.text_hash,
-                scan_limit,
-            )
-            .await?;
-        let threshold = threshold.clamp(0.0, 1.0);
-        let mut candidates = rows
-            .into_iter()
-            .filter_map(|row| {
-                let score = similarity_score(fingerprint.similarity_hash, row.similarity_hash);
-                (score >= threshold).then_some(FuzzySpamCandidate {
-                    id: row.id,
-                    reason: row.reason,
-                    score,
-                    confidence: row.confidence,
-                    evidence_count: row.evidence_count,
-                })
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
-        candidates.truncate(result_limit);
-        Ok(candidates)
     }
 
     pub(crate) async fn find_similar_candidates_batch(
@@ -247,10 +251,11 @@ impl SpamCacheRepository {
 
     pub(crate) async fn put_decision(&self, input: DecisionInput<'_>) -> Result<CachedDecision> {
         if input.state != DecisionState::Active
-            || input.evidence_count < DEFAULT_ACTIVATION_EVIDENCE
+            || input.evidence_count < ACTIVATION_EVIDENCE_THRESHOLD
         {
             bail!("direct decision storage is restricted to already active spam");
         }
+        let mut transaction = self.pool.begin().await?;
         let row = query_as::<_, CachedDecisionRow>(
             r#"
             UPDATE message_decisions
@@ -265,7 +270,7 @@ impl SpamCacheRepository {
               AND normalizer_version = ?7
               AND verdict = 'spam'
               AND state = 'active'
-              AND evidence_count >= 2
+              AND evidence_count >= ?8
             RETURNING
                 id,
                 verdict,
@@ -284,11 +289,14 @@ impl SpamCacheRepository {
         .bind(&input.fingerprint.chat_scope_hash)
         .bind(&input.policy.policy_version)
         .bind(input.policy.normalizer_version)
-        .fetch_optional(&self.pool)
+        .bind(ACTIVATION_EVIDENCE_THRESHOLD)
+        .fetch_optional(&mut *transaction)
         .await?;
         let Some(row) = row else {
             bail!("active spam decision with distinct evidence was not found");
         };
+        delete_ham(&mut transaction, &input.fingerprint.text_hash, input.policy).await?;
+        transaction.commit().await?;
         CachedDecision::try_from(row)
     }
 
@@ -302,7 +310,6 @@ impl SpamCacheRepository {
         ttl: Duration,
     ) -> Result<CachedDecision> {
         validate_source_hash(evidence_source_hash)?;
-        let activation_evidence = DEFAULT_ACTIVATION_EVIDENCE;
         let expires_at = expires_at(ttl);
         let cache_key = cache_key(fingerprint, policy);
         let mut transaction = self.pool.begin().await?;
@@ -412,11 +419,7 @@ impl SpamCacheRepository {
                 .bind(decision_id)
                 .fetch_one(&mut *transaction)
                 .await?;
-        let state = if evidence_count >= activation_evidence {
-            DecisionState::Active
-        } else {
-            DecisionState::Tentative
-        };
+        let state = activation_state(evidence_count);
         let row = query_as::<_, CachedDecisionRow>(
             r#"
             UPDATE message_decisions
@@ -447,6 +450,7 @@ impl SpamCacheRepository {
         .bind(decision_id)
         .fetch_one(&mut *transaction)
         .await?;
+        delete_ham(&mut transaction, &fingerprint.text_hash, policy).await?;
         transaction.commit().await?;
         CachedDecision::try_from(row)
     }
@@ -460,10 +464,11 @@ impl SpamCacheRepository {
             WHERE id = ?1
               AND verdict = 'spam'
               AND state = 'active'
-              AND evidence_count >= 2
+              AND evidence_count >= ?2
             "#,
         )
         .bind(id)
+        .bind(ACTIVATION_EVIDENCE_THRESHOLD)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -491,7 +496,23 @@ impl SpamCacheRepository {
         .execute(&self.pool)
         .await?
         .rows_affected();
-        Ok(affected)
+        let ham_affected = query(
+            r#"
+            DELETE FROM message_ham_decisions
+            WHERE rowid IN (
+                SELECT rowid
+                FROM message_ham_decisions
+                WHERE expires_at <= unixepoch()
+                ORDER BY expires_at ASC
+                LIMIT ?1
+            )
+            "#,
+        )
+        .bind(limit.max(1))
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected.saturating_add(ham_affected))
     }
 }
 
@@ -557,6 +578,32 @@ impl SpamDecisionStore for SpamCacheRepository {
 
     fn mark_hit(&self, id: i64) -> futures::future::BoxFuture<'_, Result<()>> {
         Box::pin(SpamCacheRepository::mark_hit(self, id))
+    }
+
+    fn find_ham_batch<'a>(
+        &'a self,
+        text_hashes: &'a [String],
+        policy: &'a CachePolicy,
+    ) -> futures::future::BoxFuture<'a, Result<HashSet<String>>> {
+        Box::pin(SpamCacheRepository::find_ham_batch(
+            self,
+            text_hashes,
+            policy,
+        ))
+    }
+
+    fn record_ham<'a>(
+        &'a self,
+        fingerprint: &'a MessageFingerprint,
+        policy: &'a CachePolicy,
+        ttl: Duration,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(SpamCacheRepository::record_ham(
+            self,
+            fingerprint,
+            policy,
+            ttl,
+        ))
     }
 
     fn prune_expired_batch(&self, limit: i64) -> futures::future::BoxFuture<'_, Result<u64>> {
@@ -680,10 +727,34 @@ fn cache_key(fingerprint: &MessageFingerprint, policy: &CachePolicy) -> String {
     )
 }
 
+fn ttl_seconds(ttl: Duration) -> i64 {
+    i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX)
+}
+
 fn expires_at(ttl: Duration) -> i64 {
     let now = chrono::Utc::now().timestamp();
-    let ttl_seconds = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
-    now.saturating_add(ttl_seconds)
+    now.saturating_add(ttl_seconds(ttl))
+}
+
+async fn delete_ham(
+    transaction: &mut Transaction<'_, Sqlite>,
+    text_hash: &str,
+    policy: &CachePolicy,
+) -> Result<()> {
+    query(
+        r#"
+        DELETE FROM message_ham_decisions
+        WHERE text_hash = ?1
+          AND policy_version = ?2
+          AND normalizer_version = ?3
+        "#,
+    )
+    .bind(text_hash)
+    .bind(&policy.policy_version)
+    .bind(policy.normalizer_version)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 fn validate_source_hash(source_hash: &str) -> Result<()> {
@@ -709,7 +780,10 @@ mod tests {
 
     use crate::{db::init_pool, domain::MessageFingerprint};
 
-    use super::{CachePolicy, DecisionState, DecisionVerdict, SpamCacheRepository};
+    use super::{
+        CachePolicy, DecisionInput, DecisionState, DecisionVerdict, SpamCacheRepository,
+        ACTIVATION_EVIDENCE_THRESHOLD,
+    };
 
     fn fingerprint(chat_id: i64, text: &str) -> MessageFingerprint {
         MessageFingerprint::from_text(chat_id, text, 1).expect("fingerprint")
@@ -752,9 +826,13 @@ mod tests {
         assert_eq!(repeated.state, DecisionState::Tentative);
         assert_eq!(repeated.evidence_count, 1);
         assert!(repository
-            .find_exact_decision(&fingerprint, &policy)
+            .find_exact_batch(
+                std::slice::from_ref(&fingerprint.text_hash),
+                &policy.policy_version,
+                policy.normalizer_version,
+            )
             .await?
-            .is_none());
+            .is_empty());
         pool.close().await;
         Ok(())
     }
@@ -789,11 +867,15 @@ mod tests {
             .await?;
 
         assert_eq!(active.state, DecisionState::Active);
-        assert_eq!(active.evidence_count, 2);
+        assert_eq!(active.evidence_count, ACTIVATION_EVIDENCE_THRESHOLD);
         assert!(repository
-            .find_exact_decision(&fingerprint, &policy)
+            .find_exact_batch(
+                std::slice::from_ref(&fingerprint.text_hash),
+                &policy.policy_version,
+                policy.normalizer_version,
+            )
             .await?
-            .is_some());
+            .contains_key(&fingerprint.text_hash));
         pool.close().await;
         Ok(())
     }
@@ -830,15 +912,25 @@ mod tests {
             .await?;
         assert!(exact.contains_key(&stored.text_hash));
         assert!(!exact.contains_key(&other_chat.text_hash));
-        assert_eq!(
-            repository
-                .find_fuzzy_candidates(&same_chat, &policy, 0.75, 100, 10)
-                .await?
-                .len(),
-            1
-        );
+        let similar = repository
+            .find_similar_candidates_batch(
+                std::slice::from_ref(&same_chat),
+                0.75,
+                100,
+                &policy.policy_version,
+                policy.normalizer_version,
+            )
+            .await?;
+        assert_eq!(similar.len(), 1);
+        assert!(similar.contains_key(&same_chat.text_hash));
         assert!(repository
-            .find_fuzzy_candidates(&other_chat, &policy, 0.75, 100, 10)
+            .find_similar_candidates_batch(
+                std::slice::from_ref(&other_chat),
+                0.75,
+                100,
+                &policy.policy_version,
+                policy.normalizer_version,
+            )
             .await?
             .is_empty());
         pool.close().await;
@@ -887,6 +979,230 @@ mod tests {
         assert!(!stored.1.contains(original));
         assert!(!stored.2.contains(original));
         assert!(!stored.3.as_deref().unwrap_or_default().contains(original));
+
+        repository
+            .record_ham(&fingerprint, &policy, Duration::from_secs(60))
+            .await?;
+        let ham_columns: Vec<String> =
+            query_scalar("SELECT name FROM pragma_table_info('message_ham_decisions')")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(
+            ham_columns,
+            vec![
+                "text_hash".to_string(),
+                "policy_version".to_string(),
+                "normalizer_version".to_string(),
+                "hit_count".to_string(),
+                "created_at".to_string(),
+                "last_seen_at".to_string(),
+                "expires_at".to_string(),
+            ]
+        );
+        let ham_stored: (String, String) = query_as(
+            r#"
+            SELECT text_hash, policy_version
+            FROM message_ham_decisions
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(!ham_stored.0.contains(original));
+        assert!(!ham_stored.1.contains(original));
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recorded_ham_is_found_and_unknown_hash_is_not() -> Result<()> {
+        let dir = tempdir()?;
+        let pool = init_pool(&dir.path().join("cache.db")).await?;
+        let repository = SpamCacheRepository::new(pool.clone());
+        let known = fingerprint(-1001, "오늘 회의 시간 조정 부탁드립니다");
+        let unknown = fingerprint(-1001, "기록되지 않은 메시지");
+        let policy = CachePolicy::default();
+
+        repository
+            .record_ham(&known, &policy, Duration::from_secs(60))
+            .await?;
+        let hits = repository
+            .find_ham_batch(
+                &[known.text_hash.clone(), unknown.text_hash.clone()],
+                &policy,
+            )
+            .await?;
+
+        assert!(hits.contains(&known.text_hash));
+        assert!(!hits.contains(&unknown.text_hash));
+        assert!(repository.find_ham_batch(&[], &policy).await?.is_empty());
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_ham_is_not_returned() -> Result<()> {
+        let dir = tempdir()?;
+        let pool = init_pool(&dir.path().join("cache.db")).await?;
+        let repository = SpamCacheRepository::new(pool.clone());
+        let expired = fingerprint(-1001, "만료될 정상 메시지");
+        let policy = CachePolicy::default();
+
+        repository
+            .record_ham(&expired, &policy, Duration::from_secs(60))
+            .await?;
+        query("UPDATE message_ham_decisions SET expires_at = unixepoch() - 1")
+            .execute(&pool)
+            .await?;
+
+        assert!(repository
+            .find_ham_batch(std::slice::from_ref(&expired.text_hash), &policy)
+            .await?
+            .is_empty());
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_ham_records_extend_ttl_and_count_hits() -> Result<()> {
+        let dir = tempdir()?;
+        let pool = init_pool(&dir.path().join("cache.db")).await?;
+        let repository = SpamCacheRepository::new(pool.clone());
+        let stored = fingerprint(-1001, "정상으로 반복 확인되는 메시지");
+        let policy = CachePolicy::default();
+
+        repository
+            .record_ham(&stored, &policy, Duration::from_secs(60))
+            .await?;
+        let first: (i64, i64) = query_as("SELECT hit_count, expires_at FROM message_ham_decisions")
+            .fetch_one(&pool)
+            .await?;
+        repository
+            .record_ham(&stored, &policy, Duration::from_secs(600))
+            .await?;
+        let second: (i64, i64) =
+            query_as("SELECT hit_count, expires_at FROM message_ham_decisions")
+                .fetch_one(&pool)
+                .await?;
+
+        assert_eq!(first.0, 0);
+        assert_eq!(second.0, 1);
+        assert!(second.1 > first.1);
+        let row_count: i64 = query_scalar("SELECT COUNT(*) FROM message_ham_decisions")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(row_count, 1);
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observing_spam_invalidates_ham_cache() -> Result<()> {
+        let dir = tempdir()?;
+        let pool = init_pool(&dir.path().join("cache.db")).await?;
+        let repository = SpamCacheRepository::new(pool.clone());
+        let stored = fingerprint(-1001, "나중에 스팸으로 확정되는 메시지");
+        let policy = CachePolicy::default();
+
+        repository
+            .record_ham(&stored, &policy, Duration::from_secs(600))
+            .await?;
+        assert!(repository
+            .find_ham_batch(std::slice::from_ref(&stored.text_hash), &policy)
+            .await?
+            .contains(&stored.text_hash));
+
+        repository
+            .observe_spam(
+                &stored,
+                &source(-1001, 10),
+                &policy,
+                None,
+                Some("투자 홍보"),
+                Duration::from_secs(60),
+            )
+            .await?;
+
+        let remaining: i64 = query_scalar("SELECT COUNT(*) FROM message_ham_decisions")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(remaining, 0);
+        assert!(repository
+            .find_ham_batch(std::slice::from_ref(&stored.text_hash), &policy)
+            .await?
+            .is_empty());
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn put_decision_invalidates_ham_cache() -> Result<()> {
+        let dir = tempdir()?;
+        let pool = init_pool(&dir.path().join("cache.db")).await?;
+        let repository = SpamCacheRepository::new(pool.clone());
+        let stored = fingerprint(-1001, "활성화 후 갱신되는 메시지");
+        let policy = CachePolicy::default();
+
+        for source_id in [10, 11] {
+            repository
+                .observe_spam(
+                    &stored,
+                    &source(-1001, source_id),
+                    &policy,
+                    None,
+                    Some("투자 홍보"),
+                    Duration::from_secs(60),
+                )
+                .await?;
+        }
+        repository
+            .record_ham(&stored, &policy, Duration::from_secs(600))
+            .await?;
+
+        repository
+            .put_decision(DecisionInput {
+                fingerprint: &stored,
+                state: DecisionState::Active,
+                confidence: Some(0.9),
+                policy: &policy,
+                evidence_count: ACTIVATION_EVIDENCE_THRESHOLD,
+                reason: Some("투자 홍보"),
+                ttl: Duration::from_secs(60),
+            })
+            .await?;
+
+        let remaining: i64 = query_scalar("SELECT COUNT(*) FROM message_ham_decisions")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(remaining, 0);
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_ham_rows_are_pruned() -> Result<()> {
+        let dir = tempdir()?;
+        let pool = init_pool(&dir.path().join("cache.db")).await?;
+        let repository = SpamCacheRepository::new(pool.clone());
+        let expired = fingerprint(-1001, "만료된 정상 캐시");
+        let alive = fingerprint(-1001, "유효한 정상 캐시");
+        let policy = CachePolicy::default();
+
+        repository
+            .record_ham(&expired, &policy, Duration::ZERO)
+            .await?;
+        repository
+            .record_ham(&alive, &policy, Duration::from_secs(600))
+            .await?;
+        query("UPDATE message_ham_decisions SET expires_at = unixepoch() - 1 WHERE text_hash = ?1")
+            .bind(&expired.text_hash)
+            .execute(&pool)
+            .await?;
+
+        assert_eq!(repository.prune_expired().await?, 1);
+        let remaining: Vec<String> = query_scalar("SELECT text_hash FROM message_ham_decisions")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(remaining, vec![alive.text_hash.clone()]);
         pool.close().await;
         Ok(())
     }

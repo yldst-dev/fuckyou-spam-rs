@@ -18,19 +18,26 @@ use teloxide::{
 use tokio::time::{timeout, Duration, Instant};
 
 use crate::{
-    application::ports::{MessageSubmissionQueue, WhitelistEntry, WhitelistGateway},
+    application::{
+        ports::{
+            MessageSubmissionOutcome, MessageSubmissionQueue, WhitelistEntry, WhitelistGateway,
+        },
+        triage::triage,
+    },
     config::AppConfig,
-    domain::{ChatId as DomainChatId, MessageId as DomainMessageId, MessageJob},
+    domain::{url::extract_urls, ChatId as DomainChatId, MessageId as DomainMessageId, MessageJob},
     infrastructure::{
         notifier::notify_admin_group,
         shutdown::{RestartCallback, ShutdownListener},
     },
-    tasks::queue::QueuePushOutcome,
 };
 
 use super::{
-    types::{AppState, BotResult, GeneralCommand, MessageRateLimitOutcome},
-    utils::{admin_command_list, calc_priority, extract_urls, format_user_display, user_to_i64},
+    commands::{admin_command_list, GeneralCommand},
+    rate_limit::MessageRateLimitOutcome,
+    state::AppState,
+    utils::{format_user_display, user_to_i64},
+    BotResult,
 };
 
 pub(crate) struct TelegramService {
@@ -389,7 +396,7 @@ impl TelegramService {
             false
         };
 
-        let (priority, priority_score) = calc_priority(&text, is_group_member);
+        let (priority, priority_score) = triage(&text, is_group_member);
         let urls = extract_urls(&text, state.config.web.max_urls_per_message);
         let job = MessageJob {
             chat_id: DomainChatId(msg.chat.id.0),
@@ -408,7 +415,7 @@ impl TelegramService {
         let chat_id = job.chat_id.0;
         let message_id = job.message_id.0;
         match state.submission_queue.submit(priority, job) {
-            QueuePushOutcome::Enqueued => {
+            MessageSubmissionOutcome::Enqueued => {
                 tracing::debug!(
                     target: "queue",
                     chat_id,
@@ -417,7 +424,7 @@ impl TelegramService {
                     "message job enqueued"
                 );
             }
-            QueuePushOutcome::DroppedNew => {
+            MessageSubmissionOutcome::DroppedNew => {
                 tracing::warn!(
                     target: "queue",
                     chat_id,
@@ -426,7 +433,7 @@ impl TelegramService {
                     "message job dropped before spam classification"
                 );
             }
-            QueuePushOutcome::DroppedOldestNormal => {
+            MessageSubmissionOutcome::DroppedOldestNormal => {
                 tracing::warn!(
                     target: "queue",
                     chat_id,

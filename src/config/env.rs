@@ -1,8 +1,8 @@
-use std::{net::IpAddr, time::Duration};
+use std::{fmt, net::IpAddr, time::Duration};
 
 use thiserror::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct AppConfig {
     pub telegram_bot_token: String,
     pub bot_username: Option<String>,
@@ -20,11 +20,42 @@ pub(crate) struct AppConfig {
     pub resilience: ResilienceConfig,
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Debug for AppConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppConfig")
+            .field("telegram_bot_token", &"***")
+            .field("bot_username", &self.bot_username)
+            .field("admin_user_id", &self.admin_user_id)
+            .field("admin_group_id", &self.admin_group_id)
+            .field("allowed_chat_ids", &self.allowed_chat_ids)
+            .field("cerebras", &self.cerebras)
+            .field("directories", &self.directories)
+            .field("logging", &self.logging)
+            .field("timezone", &self.timezone)
+            .field("queue", &self.queue)
+            .field("processor", &self.processor)
+            .field("spam_cache", &self.spam_cache)
+            .field("web", &self.web)
+            .field("resilience", &self.resilience)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct CerebrasConfig {
     pub api_key: String,
     pub model: String,
     pub request_timeout: Duration,
+}
+
+impl fmt::Debug for CerebrasConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CerebrasConfig")
+            .field("api_key", &"***")
+            .field("model", &self.model)
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +97,7 @@ pub(crate) struct SpamCacheConfig {
     pub normalizer_version: i64,
     pub tentative_ttl: Duration,
     pub confirmed_ttl: Duration,
+    pub ham_ttl: Duration,
     pub prune_interval: Duration,
 }
 

@@ -17,7 +17,11 @@ use tokio::time::error::Elapsed;
 use tracing::warn;
 use url::Url;
 
-use crate::{application::ports::WebContentReader, config::WebContentConfig, domain::WebContent};
+use crate::{
+    application::ports::WebContentReader,
+    config::WebContentConfig,
+    domain::{url::origin_for_log as url_origin_for_log, WebContent},
+};
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_PINNED_CLIENTS: usize = 128;
@@ -51,7 +55,7 @@ impl WebContentFetcher {
                     warn!(
                         target: "web",
                         error = %err,
-                        endpoint = %safe_url_for_log(&url),
+                        endpoint = %url_origin_for_log(&url),
                         "web fetch failed"
                     );
                     return Ok(None);
@@ -59,7 +63,7 @@ impl WebContentFetcher {
                 Err(_) => {
                     warn!(
                         target: "web",
-                        endpoint = %safe_url_for_log(&url),
+                        endpoint = %url_origin_for_log(&url),
                         "web fetch deadline exceeded"
                     );
                     return Ok(None);
@@ -80,7 +84,7 @@ impl WebContentFetcher {
                     warn!(
                         target: "web",
                         error = %err,
-                        endpoint = %safe_url_for_log(&url),
+                        endpoint = %url_origin_for_log(&url),
                         "Readability init failed"
                     );
                     return Ok(None);
@@ -93,7 +97,7 @@ impl WebContentFetcher {
                 warn!(
                     target: "web",
                     error = %err,
-                    endpoint = %safe_url_for_log(&url),
+                    endpoint = %url_origin_for_log(&url),
                     "Readability parse failed"
                 );
                 return Ok(None);
@@ -129,7 +133,7 @@ impl WebContentFetcher {
                     warn!(
                         target: "web",
                         error = %err,
-                        endpoint = %safe_url_for_log(url),
+                        endpoint = %url_origin_for_log(url),
                         "failed to build fetch client"
                     );
                     return Ok(None);
@@ -140,7 +144,7 @@ impl WebContentFetcher {
                 .get(url.clone())
                 .send()
                 .await
-                .with_context(|| format!("failed to fetch {}", safe_url_for_log(url)))?;
+                .with_context(|| format!("failed to fetch {}", url_origin_for_log(url)))?;
 
             if is_redirect(response.status()) {
                 if response.url() != url {
@@ -366,19 +370,6 @@ fn allowed_port(url: &Url) -> Option<u16> {
     matches!(port, 80 | 443).then_some(port)
 }
 
-fn safe_url_for_log(url: &Url) -> String {
-    let host = match url.host() {
-        Some(url::Host::Ipv6(ip)) => format!("[{ip}]"),
-        Some(host) => host.to_string(),
-        None => return url.scheme().to_string(),
-    };
-
-    match url.port() {
-        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
-        None => format!("{}://{}", url.scheme(), host),
-    }
-}
-
 fn equivalent_ip(left: IpAddr, right: IpAddr) -> bool {
     canonical_ip(left) == canonical_ip(right)
 }
@@ -589,7 +580,7 @@ mod tests {
     #[test]
     fn redacts_url_path_query_and_fragment() {
         let url = Url::parse("https://example.com:443/private/path?token=secret#fragment").unwrap();
-        assert_eq!(safe_url_for_log(&url), "https://example.com");
+        assert_eq!(url_origin_for_log(&url), "https://example.com");
     }
 
     #[test]

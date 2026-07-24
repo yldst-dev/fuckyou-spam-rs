@@ -30,6 +30,23 @@ flowchart LR
     G -->|"정상"| I["유지"]
 ```
 
+## 프로젝트 구조
+
+```
+src/
+  domain/         메시지 모델, fingerprint, URL 처리, 스팸 사유 정규화
+  application/    포트 정의, 접근·판정·우선순위 정책, 스팸 조치 유스케이스
+  telegram/       dispatcher, 관리 명령, 상태, 레이트 리밋, 멤버십 캐시, 삭제 게이트웨이
+  ai/             Cerebras 클라이언트, 요청·응답 처리, 프롬프트 직렬화
+  db/             화이트리스트와 스팸 판정 캐시 저장소
+  infrastructure/ 우선순위 큐, 웹 본문 수집, heartbeat, 알림, 로그, 종료, 인스턴스 락
+  config/         환경변수 파싱과 검증
+  app.rs          의존성 조립과 수명주기
+migrations/       SQLite 스키마 마이그레이션
+```
+
+`domain`은 다른 내부 모듈에 의존하지 않으며 어댑터 구현은 `application/ports.rs`의 트레이트를 통해 주입됩니다. 계층 규칙과 잔여 항목은 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)에 정리되어 있습니다.
+
 ## Docker Compose
 
 Docker와 Docker Compose v2가 필요합니다.
@@ -58,7 +75,7 @@ SQLite DB, WAL, 런타임 잠금은 `bot-data` named volume에 저장됩니다. 
 
 Compose는 파일 로그를 끄고 stdout만 사용합니다. 애플리케이션 초기화를 위한 쓰기 가능한 로그 경로는 `/tmp/logs`로 두며 컨테이너 재생성 시 제거됩니다. 운영 로그의 기준은 `docker compose logs`와 Dokploy 로그 뷰어입니다.
 
-메시지 수집은 기본적으로 60초당 사용자 12건, 채팅 120건으로 제한됩니다. 제한 상태와 멤버십 캐시는 메모리 상한과 만료 시간을 가지며 재시작 시 초기화됩니다.
+메시지 수집은 60초당 사용자 12건, 채팅 120건으로 제한됩니다. 이 수치는 현재 환경변수로 조정할 수 없는 고정값입니다. 제한 상태와 멤버십 캐시는 메모리 상한과 만료 시간을 가지며 재시작 시 초기화됩니다.
 
 ## Dokploy
 
@@ -111,11 +128,14 @@ cargo run --release --locked
 | `SPAM_CACHE_NORMALIZER_VERSION` | `3` | 정규화 규칙 버전 |
 | `SPAM_CACHE_TENTATIVE_TTL_SECS` | `86400` | 잠정 스팸 보존 시간 |
 | `SPAM_CACHE_CONFIRMED_TTL_SECS` | `7776000` | 확인된 스팸 보존 시간 |
+| `SPAM_CACHE_HAM_TTL_SECS` | `21600` | 정상 판정 보존 시간 |
 | `SPAM_CACHE_PRUNE_INTERVAL_SECS` | `3600` | 만료 캐시 정리 주기 |
 | `BOT_TIMEZONE` | `Asia/Seoul` | 관리 알림 표시 시간대 |
 | `NETWORK_ERROR_THRESHOLD` | `5` | 네트워크 오류 임계값 |
 | `NETWORK_ERROR_WINDOW_SECS` | `60` | 네트워크 오류 집계 구간 |
 | `EMERGENCY_RESTART_COOLDOWN_SECS` | `600` | 볼륨에 유지되는 비상 재시작 최소 간격 |
+
+수치 환경변수에 해석할 수 없는 값이 들어오면 기본값으로 대체하고 기동 직후 `config` 대상 경고 로그를 남깁니다. 타임아웃, 재시도 횟수, 배치 크기, 큐 용량, 동시성, TTL, 재시작 최소 간격은 `0`을 유효하지 않은 값으로 취급합니다. `SPAM_CACHE_SIMILARITY_THRESHOLD`는 `0` 초과 `1` 이하만 허용합니다. `PROCESSOR_MAX_REQUEUES`만 `0`을 재큐잉 비활성으로 해석합니다.
 
 ## 관리 명령
 

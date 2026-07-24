@@ -1,9 +1,11 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
-use serde::Serialize;
 
 use crate::domain::{ClassificationMap, MessageFingerprint, MessageJob, QueueSnapshot, WebContent};
 
@@ -100,8 +102,17 @@ pub(crate) struct FuzzySpamCandidate {
     pub evidence_count: i64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ClassificationItem {
+    pub id: String,
+    pub content: String,
+}
+
 pub(crate) trait SpamClassifier: Send + Sync {
-    fn classify<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Result<ClassificationMap>>;
+    fn classify<'a>(
+        &'a self,
+        items: &'a [ClassificationItem],
+    ) -> BoxFuture<'a, Result<ClassificationMap>>;
 }
 
 pub(crate) trait SpamDecisionStore: Send + Sync {
@@ -138,6 +149,19 @@ pub(crate) trait SpamDecisionStore: Send + Sync {
 
     fn mark_hit(&self, id: i64) -> BoxFuture<'_, Result<()>>;
 
+    fn find_ham_batch<'a>(
+        &'a self,
+        text_hashes: &'a [String],
+        policy: &'a CachePolicy,
+    ) -> BoxFuture<'a, Result<HashSet<String>>>;
+
+    fn record_ham<'a>(
+        &'a self,
+        fingerprint: &'a MessageFingerprint,
+        policy: &'a CachePolicy,
+        ttl: Duration,
+    ) -> BoxFuture<'a, Result<()>>;
+
     fn prune_expired_batch(&self, limit: i64) -> BoxFuture<'_, Result<u64>>;
 }
 
@@ -170,6 +194,16 @@ pub(crate) trait MessageSubmissionQueue: Send + Sync {
     fn snapshot(&self) -> QueueSnapshot;
 }
 
+pub(crate) trait MessageWorkQueue: MessageSubmissionQueue {
+    fn drain_batch(&self, max_items: usize) -> Vec<MessageJob>;
+
+    fn wait_for_items(&self) -> BoxFuture<'_, ()>;
+}
+
+pub(crate) trait HeartbeatReporter: Send + Sync {
+    fn report(&self) -> BoxFuture<'_, Result<()>>;
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WhitelistEntry {
     pub chat_id: i64,
@@ -178,13 +212,11 @@ pub(crate) struct WhitelistEntry {
     pub added_by: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct WhitelistRow {
     pub chat_id: i64,
     pub chat_title: Option<String>,
-    pub chat_type: Option<String>,
     pub added_at: DateTime<Utc>,
-    pub added_by: Option<i64>,
 }
 
 pub(crate) trait WhitelistGateway: Send + Sync {

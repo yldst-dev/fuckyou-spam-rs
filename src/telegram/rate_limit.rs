@@ -1,30 +1,11 @@
 use std::{
     collections::{HashMap, VecDeque},
     hash::Hash,
-    sync::Arc,
     time::Duration,
 };
 
-use parking_lot::Mutex;
-use teloxide::{
-    prelude::*,
-    types::{ChatId, ChatMemberStatus},
-    utils::command::BotCommands,
-};
 use tokio::time::Instant;
 
-use crate::{
-    application::{
-        chat_access::{chat_access_decision, ChatAccessDecision},
-        ports::{MessageSubmissionQueue, WhitelistGateway},
-    },
-    config::AppConfig,
-};
-
-pub(crate) type BotResult<T> = Result<T, teloxide::RequestError>;
-
-const MEMBER_CACHE_TTL: Duration = Duration::from_secs(120);
-const MEMBER_CACHE_MAX_ENTRIES: usize = 10_000;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const RATE_LIMIT_IDLE_TTL: Duration = Duration::from_secs(600);
 const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
@@ -32,11 +13,6 @@ const RATE_LIMIT_USER_MESSAGES: u32 = 12;
 const RATE_LIMIT_CHAT_MESSAGES: u32 = 120;
 const RATE_LIMIT_MAX_USERS: usize = 10_000;
 const RATE_LIMIT_MAX_CHATS: usize = 2_000;
-
-struct CachedMembership {
-    is_member: bool,
-    expires_at: Instant,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MessageRateLimitOutcome {
@@ -46,7 +22,7 @@ pub(crate) enum MessageRateLimitOutcome {
 }
 
 #[derive(Clone, Copy)]
-struct RateLimitConfig {
+pub(super) struct RateLimitConfig {
     window: Duration,
     idle_ttl: Duration,
     cleanup_interval: Duration,
@@ -146,7 +122,7 @@ where
     }
 }
 
-struct MessageRateLimiter {
+pub(super) struct MessageRateLimiter {
     config: RateLimitConfig,
     users: BoundedBuckets<i64>,
     chats: BoundedBuckets<i64>,
@@ -154,7 +130,7 @@ struct MessageRateLimiter {
 }
 
 impl MessageRateLimiter {
-    fn new(config: RateLimitConfig, now: Instant) -> Self {
+    pub(super) fn new(config: RateLimitConfig, now: Instant) -> Self {
         Self {
             users: BoundedBuckets::new(config.max_users),
             chats: BoundedBuckets::new(config.max_chats),
@@ -163,7 +139,7 @@ impl MessageRateLimiter {
         }
     }
 
-    fn check(
+    pub(super) fn check(
         &mut self,
         chat_id: i64,
         user_id: Option<i64>,
@@ -204,138 +180,6 @@ impl MessageRateLimiter {
         self.chats.remove_idle(now, self.config.idle_ttl);
         self.last_cleanup_at = now;
     }
-}
-
-pub(crate) struct AppState {
-    pub config: Arc<AppConfig>,
-    pub whitelist: Arc<dyn WhitelistGateway>,
-    pub submission_queue: Arc<dyn MessageSubmissionQueue>,
-    member_cache: Mutex<HashMap<(i64, u64), CachedMembership>>,
-    rate_limiter: Mutex<MessageRateLimiter>,
-}
-
-impl AppState {
-    pub(crate) fn new(
-        config: Arc<AppConfig>,
-        whitelist: Arc<dyn WhitelistGateway>,
-        submission_queue: Arc<dyn MessageSubmissionQueue>,
-    ) -> Self {
-        Self {
-            config,
-            whitelist,
-            submission_queue,
-            member_cache: Mutex::new(HashMap::new()),
-            rate_limiter: Mutex::new(MessageRateLimiter::new(
-                RateLimitConfig::default(),
-                Instant::now(),
-            )),
-        }
-    }
-
-    pub(crate) async fn is_chat_allowed(&self, chat_id: i64) -> bool {
-        match chat_access_decision(
-            chat_id,
-            self.config.admin_group_id,
-            &self.config.allowed_chat_ids,
-        ) {
-            ChatAccessDecision::Allow => true,
-            ChatAccessDecision::CheckWhitelist => {
-                self.whitelist.is_allowed(chat_id).await.unwrap_or(false)
-            }
-        }
-    }
-
-    pub(crate) fn is_admin_group(&self, chat_id: i64) -> bool {
-        self.config.admin_group_id == Some(chat_id)
-    }
-
-    pub(crate) fn is_admin_user(&self, user_id: i64) -> bool {
-        self.config.admin_user_id == Some(user_id)
-    }
-
-    pub(crate) fn check_message_rate(
-        &self,
-        chat_id: i64,
-        user_id: Option<i64>,
-    ) -> MessageRateLimitOutcome {
-        self.rate_limiter
-            .lock()
-            .check(chat_id, user_id, Instant::now())
-    }
-
-    pub(crate) async fn is_group_member(
-        &self,
-        bot: &Bot,
-        chat_id: ChatId,
-        user_id: UserId,
-    ) -> bool {
-        let key = (chat_id.0, user_id.0);
-        let now = Instant::now();
-        if let Some(is_member) = self
-            .member_cache
-            .lock()
-            .get(&key)
-            .filter(|entry| entry.expires_at > now)
-            .map(|entry| entry.is_member)
-        {
-            return is_member;
-        }
-
-        let is_member = match bot.get_chat_member(chat_id, user_id).await {
-            Ok(member) => !matches!(
-                member.status(),
-                ChatMemberStatus::Left | ChatMemberStatus::Banned
-            ),
-            Err(err) => {
-                tracing::warn!(
-                    target: "telegram",
-                    error = %err,
-                    chat_id = chat_id.0,
-                    user_id = user_id.0,
-                    "멤버십 확인 실패"
-                );
-                return false;
-            }
-        };
-
-        let now = Instant::now();
-        let mut cache = self.member_cache.lock();
-        if cache.len() >= MEMBER_CACHE_MAX_ENTRIES {
-            cache.retain(|_, entry| entry.expires_at > now);
-            if cache.len() >= MEMBER_CACHE_MAX_ENTRIES {
-                if let Some(oldest_key) = cache
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.expires_at)
-                    .map(|(key, _)| *key)
-                {
-                    cache.remove(&oldest_key);
-                }
-            }
-        }
-        cache.insert(
-            key,
-            CachedMembership {
-                is_member,
-                expires_at: now + MEMBER_CACHE_TTL,
-            },
-        );
-        is_member
-    }
-}
-
-#[derive(BotCommands, Clone)]
-#[command(rename_rule = "snake_case", description = "사용 가능한 명령어:")]
-pub(crate) enum GeneralCommand {
-    #[command(description = "봇 소개 및 시작")]
-    Start,
-    #[command(description = "도움말")]
-    Help,
-    #[command(description = "봇 상태 확인")]
-    Status,
-    #[command(description = "현재 채팅 ID 확인")]
-    Chatid,
-    #[command(description = "응답 속도 측정")]
-    Ping,
 }
 
 #[cfg(test)]

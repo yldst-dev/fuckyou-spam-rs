@@ -1,15 +1,16 @@
 use std::{
     path::{Path, PathBuf},
-    str::FromStr,
     time::{Duration, SystemTime},
 };
 
 use anyhow::{bail, Context, Result};
+use futures::future::BoxFuture;
 use sqlx_core::query_scalar::query_scalar;
 use sqlx_sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tokio::{task::JoinHandle, time::sleep};
 
 use super::{directories::ResolvedPaths, shutdown::ShutdownListener};
+use crate::application::ports::HeartbeatReporter;
 
 const HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(240);
 const MONITOR_INTERVAL: Duration = Duration::from_secs(30);
@@ -31,18 +32,33 @@ pub(crate) async fn write_heartbeat(path: &Path) -> Result<()> {
     .with_context(|| format!("failed to write heartbeat {}", path.display()))
 }
 
+pub(crate) struct FileHeartbeat {
+    path: PathBuf,
+}
+
+impl FileHeartbeat {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl HeartbeatReporter for FileHeartbeat {
+    fn report(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(write_heartbeat(&self.path))
+    }
+}
+
 pub(crate) async fn check(paths: &ResolvedPaths) -> Result<()> {
     let heartbeat = heartbeat_path(paths);
-    let modified = tokio::fs::metadata(&heartbeat)
-        .await
-        .with_context(|| format!("heartbeat unavailable: {}", heartbeat.display()))?
-        .modified()?;
-    let age = SystemTime::now().duration_since(modified)?;
-    if age > HEARTBEAT_MAX_AGE {
+    let age = heartbeat_age(&heartbeat).await?;
+    if !heartbeat_is_fresh(age) {
         bail!("processor heartbeat is stale: {} seconds", age.as_secs());
     }
 
-    let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", paths.db_path.display()))?
+    let options = SqliteConnectOptions::new()
+        .filename(&paths.db_path)
+        .create_if_missing(false)
+        .foreign_keys(true)
         .busy_timeout(Duration::from_secs(2));
     let pool = SqlitePoolOptions::new()
         .max_connections(1)

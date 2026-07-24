@@ -1,21 +1,19 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct WebContent {
     pub title: Option<String>,
     pub site_name: Option<String>,
     pub content: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct ClassificationDecision {
     pub spam: bool,
-    #[serde(default)]
     pub reason: Option<String>,
 }
 

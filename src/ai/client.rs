@@ -3,10 +3,15 @@ use futures::future::BoxFuture;
 use reqwest::Client;
 
 use crate::{
-    application::ports::SpamClassifier, config::CerebrasConfig, domain::types::ClassificationMap,
+    application::ports::{ClassificationItem, SpamClassifier},
+    config::CerebrasConfig,
+    domain::ClassificationMap,
 };
 
-use super::inference::{build_request, parse_response, CEREBRAS_API_URL};
+use super::{
+    inference::{build_request, parse_response, CEREBRAS_API_URL},
+    prompt::classification_request,
+};
 
 #[derive(Clone)]
 pub(crate) struct CerebrasClient {
@@ -19,16 +24,18 @@ impl CerebrasClient {
         Self { http, config }
     }
 
-    pub(crate) async fn classify(&self, prompt: &str) -> Result<ClassificationMap> {
-        let request = build_request(self.config.model.clone(), prompt);
+    async fn classify_items(&self, items: &[ClassificationItem]) -> Result<ClassificationMap> {
+        let prompt = classification_request(items);
+        let request = build_request(self.config.model.clone(), &prompt);
 
         tracing::debug!(
             model = %self.config.model,
-            prompt_len = %prompt.len(),
+            items = items.len(),
+            prompt_len = prompt.len(),
             "Sending request to Cerebras API"
         );
 
-        let http_response = self
+        let response = self
             .http
             .post(CEREBRAS_API_URL)
             .timeout(self.config.request_timeout)
@@ -37,8 +44,8 @@ impl CerebrasClient {
             .send()
             .await?;
 
-        if let Err(err) = http_response.error_for_status_ref() {
-            let status = http_response.status();
+        if let Err(err) = response.error_for_status_ref() {
+            let status = response.status();
             tracing::error!(
                 status = %status,
                 "Cerebras API request failed"
@@ -46,15 +53,15 @@ impl CerebrasClient {
             return Err(err).context(format!("Cerebras API error {}", status));
         }
 
-        let response = http_response;
-
-        let classification = parse_response(response).await?;
-        Ok(classification)
+        parse_response(response).await
     }
 }
 
 impl SpamClassifier for CerebrasClient {
-    fn classify<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Result<ClassificationMap>> {
-        Box::pin(CerebrasClient::classify(self, prompt))
+    fn classify<'a>(
+        &'a self,
+        items: &'a [ClassificationItem],
+    ) -> BoxFuture<'a, Result<ClassificationMap>> {
+        Box::pin(self.classify_items(items))
     }
 }

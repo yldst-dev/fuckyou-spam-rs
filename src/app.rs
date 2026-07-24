@@ -7,17 +7,19 @@ use tokio::{task::JoinHandle, time::timeout};
 
 use crate::{
     ai::CerebrasClient,
+    application::spam_moderation::MessageProcessor,
     config::AppConfig,
     db::{self, spam_cache::SpamCacheRepository, whitelist::WhitelistRepository},
     domain::MessageJob,
     infrastructure::{
         directories::ResolvedPaths,
+        health::FileHeartbeat,
         notifier::notify_admin_group,
+        queue::MessageQueue,
         shutdown::{RestartCallback, Shutdown},
+        web_content::WebContentFetcher,
     },
-    tasks::{processor::MessageProcessor, queue::MessageQueue},
     telegram::{TelegramMessageModerationGateway, TelegramService},
-    web_content::WebContentFetcher,
 };
 
 pub(crate) struct SpamGuardApp {
@@ -73,8 +75,8 @@ impl SpamGuardApp {
             web_fetcher,
             spam_cache,
             moderation,
+            Arc::new(FileHeartbeat::new(heartbeat_path.clone())),
             config.clone(),
-            heartbeat_path.clone(),
         ));
         let processor_handle = processor.clone().spawn(shutdown.subscribe());
         let health_monitor_handle =

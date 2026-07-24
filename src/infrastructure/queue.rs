@@ -1,16 +1,15 @@
 use std::collections::VecDeque;
 
+use futures::future::BoxFuture;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::{
-    application::ports::{MessageSubmissionOutcome, MessageSubmissionQueue},
+    application::ports::{
+        MessagePriority, MessageSubmissionOutcome, MessageSubmissionQueue, MessageWorkQueue,
+    },
     config::QueueConfig,
     domain::{MessageJob, QueueSnapshot},
-};
-
-pub(crate) use crate::application::ports::{
-    MessagePriority as Priority, MessageSubmissionOutcome as QueuePushOutcome,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -38,17 +37,17 @@ impl<T> MessageQueue<T> {
         }
     }
 
-    pub(crate) fn push(&self, priority: Priority, value: T) -> QueuePushOutcome {
+    pub(crate) fn push(&self, priority: MessagePriority, value: T) -> MessageSubmissionOutcome {
         let mut high = self.high.lock();
         let mut normal = self.normal.lock();
         let current_total = high.len() + normal.len();
         let outcome = match priority {
-            Priority::High => {
+            MessagePriority::High => {
                 if high.len() < self.limits.high_priority_max
                     && current_total < self.limits.max_messages
                 {
                     high.push_back(value);
-                    QueuePushOutcome::Enqueued
+                    MessageSubmissionOutcome::Enqueued
                 } else if high.len() < self.limits.high_priority_max && normal.pop_front().is_some()
                 {
                     high.push_back(value);
@@ -59,7 +58,7 @@ impl<T> MessageQueue<T> {
                         max_messages = self.limits.max_messages,
                         "message queue dropped oldest normal-priority job for high-priority job"
                     );
-                    QueuePushOutcome::DroppedOldestNormal
+                    MessageSubmissionOutcome::DroppedOldestNormal
                 } else {
                     tracing::warn!(
                         target: "queue",
@@ -70,15 +69,15 @@ impl<T> MessageQueue<T> {
                         priority_max = self.limits.high_priority_max,
                         "message queue rejected new job"
                     );
-                    QueuePushOutcome::DroppedNew
+                    MessageSubmissionOutcome::DroppedNew
                 }
             }
-            Priority::Normal => {
+            MessagePriority::Normal => {
                 if normal.len() < self.limits.normal_priority_max
                     && current_total < self.limits.max_messages
                 {
                     normal.push_back(value);
-                    QueuePushOutcome::Enqueued
+                    MessageSubmissionOutcome::Enqueued
                 } else {
                     tracing::warn!(
                         target: "queue",
@@ -89,13 +88,13 @@ impl<T> MessageQueue<T> {
                         priority_max = self.limits.normal_priority_max,
                         "message queue rejected new job"
                     );
-                    QueuePushOutcome::DroppedNew
+                    MessageSubmissionOutcome::DroppedNew
                 }
             }
         };
         drop(normal);
         drop(high);
-        if !matches!(outcome, QueuePushOutcome::DroppedNew) {
+        if !matches!(outcome, MessageSubmissionOutcome::DroppedNew) {
             self.notify.notify_one();
         }
         outcome
@@ -147,12 +146,22 @@ impl<T> MessageQueue<T> {
 }
 
 impl MessageSubmissionQueue for MessageQueue<MessageJob> {
-    fn submit(&self, priority: Priority, job: MessageJob) -> MessageSubmissionOutcome {
+    fn submit(&self, priority: MessagePriority, job: MessageJob) -> MessageSubmissionOutcome {
         self.push(priority, job)
     }
 
     fn snapshot(&self) -> QueueSnapshot {
         MessageQueue::snapshot(self)
+    }
+}
+
+impl MessageWorkQueue for MessageQueue<MessageJob> {
+    fn drain_batch(&self, max_items: usize) -> Vec<MessageJob> {
+        self.drain_ordered_limit(max_items)
+    }
+
+    fn wait_for_items(&self) -> BoxFuture<'_, ()> {
+        Box::pin(MessageQueue::wait_for_items(self))
     }
 }
 
@@ -171,9 +180,9 @@ impl From<QueueConfig> for QueueLimits {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::QueueConfig;
+    use crate::{application::ports::MessagePriority, config::QueueConfig};
 
-    use super::{MessageQueue, Priority, QueuePushOutcome};
+    use super::{MessageQueue, MessageSubmissionOutcome};
 
     fn queue_config(
         max_messages: usize,
@@ -192,16 +201,16 @@ mod tests {
         let queue = MessageQueue::new(queue_config(2, 2, 2));
 
         assert!(matches!(
-            queue.push(Priority::Normal, 1),
-            QueuePushOutcome::Enqueued
+            queue.push(MessagePriority::Normal, 1),
+            MessageSubmissionOutcome::Enqueued
         ));
         assert!(matches!(
-            queue.push(Priority::Normal, 2),
-            QueuePushOutcome::Enqueued
+            queue.push(MessagePriority::Normal, 2),
+            MessageSubmissionOutcome::Enqueued
         ));
         assert!(matches!(
-            queue.push(Priority::Normal, 3),
-            QueuePushOutcome::DroppedNew
+            queue.push(MessagePriority::Normal, 3),
+            MessageSubmissionOutcome::DroppedNew
         ));
 
         assert_eq!(queue.drain_ordered(), vec![1, 2]);
@@ -211,11 +220,11 @@ mod tests {
     fn high_priority_drops_oldest_normal_when_total_capacity_is_full() {
         let queue = MessageQueue::new(queue_config(2, 2, 2));
 
-        let _ = queue.push(Priority::Normal, 1);
-        let _ = queue.push(Priority::Normal, 2);
+        let _ = queue.push(MessagePriority::Normal, 1);
+        let _ = queue.push(MessagePriority::Normal, 2);
         assert!(matches!(
-            queue.push(Priority::High, 3),
-            QueuePushOutcome::DroppedOldestNormal
+            queue.push(MessagePriority::High, 3),
+            MessageSubmissionOutcome::DroppedOldestNormal
         ));
 
         assert_eq!(queue.drain_ordered(), vec![3, 2]);
@@ -225,11 +234,11 @@ mod tests {
     fn rejects_high_when_high_capacity_is_full() {
         let queue = MessageQueue::new(queue_config(3, 1, 3));
 
-        let _ = queue.push(Priority::High, 1);
-        let _ = queue.push(Priority::Normal, 2);
+        let _ = queue.push(MessagePriority::High, 1);
+        let _ = queue.push(MessagePriority::Normal, 2);
         assert!(matches!(
-            queue.push(Priority::High, 3),
-            QueuePushOutcome::DroppedNew
+            queue.push(MessagePriority::High, 3),
+            MessageSubmissionOutcome::DroppedNew
         ));
 
         assert_eq!(queue.drain_ordered(), vec![1, 2]);
@@ -239,10 +248,10 @@ mod tests {
     fn drains_a_limited_priority_ordered_batch() {
         let queue = MessageQueue::new(queue_config(5, 3, 3));
 
-        let _ = queue.push(Priority::Normal, 1);
-        let _ = queue.push(Priority::Normal, 2);
-        let _ = queue.push(Priority::High, 3);
-        let _ = queue.push(Priority::High, 4);
+        let _ = queue.push(MessagePriority::Normal, 1);
+        let _ = queue.push(MessagePriority::Normal, 2);
+        let _ = queue.push(MessagePriority::High, 3);
+        let _ = queue.push(MessagePriority::High, 4);
 
         assert_eq!(queue.drain_ordered_limit(3), vec![3, 4, 1]);
         assert_eq!(queue.drain_ordered_limit(3), vec![2]);
@@ -252,7 +261,7 @@ mod tests {
     fn zero_limit_does_not_drain() {
         let queue = MessageQueue::new(queue_config(2, 2, 2));
 
-        let _ = queue.push(Priority::Normal, 1);
+        let _ = queue.push(MessagePriority::Normal, 1);
 
         assert!(queue.drain_ordered_limit(0).is_empty());
         assert_eq!(queue.drain_ordered(), vec![1]);
@@ -269,7 +278,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
 
-        let _ = queue.push(Priority::Normal, 1);
+        let _ = queue.push(MessagePriority::Normal, 1);
         waiter.await.unwrap();
     }
 }

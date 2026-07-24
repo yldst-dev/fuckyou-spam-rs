@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -19,23 +18,24 @@ use crate::{
             InitialAction,
         },
         ports::{
-            CachePolicy, CachedDecision, DecisionInput, DecisionState, DecisionVerdict,
-            FuzzySpamCandidate, MessageModerationGateway, SpamClassifier, SpamDecisionStore,
+            CachePolicy, CachedDecision, ClassificationItem, DecisionInput, DecisionState,
+            DecisionVerdict, FuzzySpamCandidate, HeartbeatReporter, MessageModerationGateway,
+            MessageSubmissionOutcome, MessageWorkQueue, SpamClassifier, SpamDecisionStore,
             WebContentReader,
         },
+        triage::priority_for,
     },
     config::AppConfig,
     domain::{
-        ClassificationDecision, ClassificationMap, MessageFingerprint, MessageJob, WebContent,
+        reason, url, ClassificationDecision, ClassificationMap, MessageFingerprint, MessageJob,
+        WebContent,
     },
-    infrastructure::{health, shutdown::ShutdownListener},
-    tasks::queue::{MessageQueue, Priority, QueuePushOutcome},
+    infrastructure::shutdown::ShutdownListener,
 };
 
-const DEFAULT_REASON: &str = "모델이 사유를 제공하지 않았습니다.";
-const MAX_REASON_CHARS: usize = 80;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const PRUNE_BATCH_SIZE: i64 = 1_000;
+const CONFIRMATION_ITEM_ID: &str = "item_0";
 
 struct PendingGroup {
     fingerprint: Option<MessageFingerprint>,
@@ -50,24 +50,24 @@ struct PreparedGroup {
 }
 
 pub(crate) struct MessageProcessor {
-    queue: Arc<MessageQueue<MessageJob>>,
+    queue: Arc<dyn MessageWorkQueue>,
     classifier: Arc<dyn SpamClassifier>,
     web_reader: Arc<dyn WebContentReader>,
     decision_store: Arc<dyn SpamDecisionStore>,
     moderation: Arc<dyn MessageModerationGateway>,
+    heartbeat: Arc<dyn HeartbeatReporter>,
     config: Arc<AppConfig>,
-    heartbeat_path: PathBuf,
 }
 
 impl MessageProcessor {
     pub(crate) fn new(
-        queue: Arc<MessageQueue<MessageJob>>,
+        queue: Arc<dyn MessageWorkQueue>,
         classifier: Arc<dyn SpamClassifier>,
         web_reader: Arc<dyn WebContentReader>,
         decision_store: Arc<dyn SpamDecisionStore>,
         moderation: Arc<dyn MessageModerationGateway>,
+        heartbeat: Arc<dyn HeartbeatReporter>,
         config: Arc<AppConfig>,
-        heartbeat_path: PathBuf,
     ) -> Self {
         Self {
             queue,
@@ -75,8 +75,8 @@ impl MessageProcessor {
             web_reader,
             decision_store,
             moderation,
+            heartbeat,
             config,
-            heartbeat_path,
         }
     }
 
@@ -93,7 +93,10 @@ impl MessageProcessor {
                 break;
             }
 
-            self.refresh_heartbeat(&mut last_heartbeat).await;
+            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                self.report_heartbeat().await;
+                last_heartbeat = Instant::now();
+            }
             if last_prune.elapsed() >= self.config.spam_cache.prune_interval {
                 self.prune_cache().await;
                 last_prune = Instant::now();
@@ -101,7 +104,7 @@ impl MessageProcessor {
 
             let batch = self
                 .queue
-                .drain_ordered_limit(self.config.processor.batch_max_messages);
+                .drain_batch(self.config.processor.batch_max_messages);
             if batch.is_empty() {
                 tokio::select! {
                     _ = self.queue.wait_for_items() => {}
@@ -114,23 +117,19 @@ impl MessageProcessor {
             self.handle_batch(batch, shutdown).await;
         }
 
-        health::write_heartbeat(&self.heartbeat_path).await?;
+        self.heartbeat.report().await?;
         tracing::info!(target: "processor", "message processor stopped");
         Ok(())
     }
 
-    async fn refresh_heartbeat(&self, last_heartbeat: &mut Instant) {
-        if last_heartbeat.elapsed() < HEARTBEAT_INTERVAL {
-            return;
-        }
-        if let Err(err) = health::write_heartbeat(&self.heartbeat_path).await {
+    async fn report_heartbeat(&self) {
+        if let Err(err) = self.heartbeat.report().await {
             tracing::warn!(
                 target: "health",
                 error = %err,
                 "failed to update processor heartbeat"
             );
         }
-        *last_heartbeat = Instant::now();
     }
 
     async fn prune_cache(&self) {
@@ -161,23 +160,30 @@ impl MessageProcessor {
         tracing::info!(target: "processor", total = batch.len(), "processing batch");
         let groups = self.group_batch(batch);
         let exact = self.load_exact_decisions(&groups).await;
+        let ham = self.load_ham_decisions(&groups).await;
         let mut pending = Vec::new();
 
         for group in groups {
-            let decision = group
+            let text_hash = group
                 .fingerprint
                 .as_ref()
-                .and_then(|fingerprint| exact.get(&fingerprint.text_hash));
+                .map(|fingerprint| fingerprint.text_hash.as_str());
+            let decision = text_hash.and_then(|text_hash| exact.get(text_hash));
+            let ham_hit = text_hash.is_some_and(|text_hash| ham.contains(text_hash));
             match (
                 cache_action(
                     decision
                         .map(|decision| decision.verdict == DecisionVerdict::Spam)
                         .unwrap_or(false),
+                    ham_hit,
                 ),
                 decision,
             ) {
                 (CacheAction::Delete, Some(decision)) => {
                     self.apply_cached_spam(&group.jobs, decision).await;
+                }
+                (CacheAction::Skip, _) => {
+                    self.apply_cached_ham(&group);
                 }
                 _ => pending.push(group),
             }
@@ -201,7 +207,7 @@ impl MessageProcessor {
             .buffer_unordered(concurrency)
             .collect::<Vec<_>>()
             .await;
-        self.write_heartbeat().await;
+        self.report_heartbeat().await;
 
         let mut groups_by_chat: HashMap<i64, Vec<PreparedGroup>> = HashMap::new();
         for group in prepared {
@@ -214,7 +220,7 @@ impl MessageProcessor {
                 if shutdown.is_triggered() {
                     return;
                 }
-                self.write_heartbeat().await;
+                self.report_heartbeat().await;
                 self.process_chunk(chunk, shutdown).await;
             }
         }
@@ -282,10 +288,10 @@ impl MessageProcessor {
     }
 
     async fn apply_cached_spam(&self, jobs: &[MessageJob], decision: &CachedDecision) {
-        let reason = sanitize_reason(decision.reason.as_deref());
+        let spam_reason = reason::sanitize(decision.reason.as_deref());
         let mut deleted = 0usize;
         for job in jobs {
-            match self.moderation.delete_spam(job, &reason).await {
+            match self.moderation.delete_spam(job, &spam_reason).await {
                 Ok(()) => deleted += 1,
                 Err(err) => {
                     tracing::error!(
@@ -316,6 +322,64 @@ impl MessageProcessor {
                     "failed to mark spam cache hit"
                 );
             }
+        }
+    }
+
+    async fn load_ham_decisions(&self, groups: &[PendingGroup]) -> HashSet<String> {
+        let hashes = groups
+            .iter()
+            .filter_map(|group| {
+                group
+                    .fingerprint
+                    .as_ref()
+                    .map(|fingerprint| fingerprint.text_hash.clone())
+            })
+            .collect::<Vec<_>>();
+        if hashes.is_empty() {
+            return HashSet::new();
+        }
+        let policy = self.cache_policy();
+        match self.decision_store.find_ham_batch(&hashes, &policy).await {
+            Ok(hits) => hits,
+            Err(err) => {
+                tracing::warn!(
+                    target: "db",
+                    error = %err,
+                    count = hashes.len(),
+                    "failed to load normal decision cache batch"
+                );
+                HashSet::new()
+            }
+        }
+    }
+
+    fn apply_cached_ham(&self, group: &PendingGroup) {
+        tracing::debug!(
+            target: "processor",
+            messages = group.jobs.len(),
+            "normal decision cache applied; classification skipped"
+        );
+    }
+
+    async fn record_ham_decision(&self, fingerprint: &MessageFingerprint) {
+        let policy = self.cache_policy();
+        if let Err(err) = self
+            .decision_store
+            .record_ham(fingerprint, &policy, self.config.spam_cache.ham_ttl)
+            .await
+        {
+            tracing::warn!(
+                target: "db",
+                error = %err,
+                "failed to record normal decision"
+            );
+        }
+    }
+
+    fn cache_policy(&self) -> CachePolicy {
+        CachePolicy {
+            policy_version: self.config.spam_cache.policy_version.clone(),
+            normalizer_version: self.config.spam_cache.normalizer_version,
         }
     }
 
@@ -352,28 +416,9 @@ impl MessageProcessor {
 
     async fn prepare_group(&self, group: PendingGroup) -> PreparedGroup {
         let representative = &group.jobs[0];
-        let member_flag = if representative.is_group_member {
-            "멤버"
-        } else {
-            "비멤버"
-        };
-        let mut entry = format!(
-            "[발신자 상태: {}] [우선순위: {}] {}",
-            member_flag, representative.priority_score, representative.text
-        );
+        let mut entry = describe_message(representative, group.similar_candidate.as_ref());
 
         if let Some(candidate) = &group.similar_candidate {
-            let reason = sanitize_reason(candidate.reason.as_deref());
-            entry.push_str(&format!(
-                "\n과거 유사 스팸 후보: 유사도 {:.0}%, 근거 {}, 신뢰도 {}, 사유 {}",
-                candidate.score * 100.0,
-                candidate.evidence_count,
-                candidate
-                    .confidence
-                    .map(|value| format!("{:.0}%", value * 100.0))
-                    .unwrap_or_else(|| "미기록".to_string()),
-                reason
-            ));
             tracing::debug!(
                 target: "processor",
                 cache_id = candidate.id,
@@ -382,20 +427,15 @@ impl MessageProcessor {
             );
         }
 
-        for url in &representative.urls {
-            match self.web_reader.fetch(url).await {
-                Ok(Some(content)) => {
-                    entry.push_str("\n웹페이지 정보 (");
-                    entry.push_str(&url_for_prompt(url));
-                    entry.push_str("):\n");
-                    entry.push_str(&format_web_content(&content));
-                }
+        for raw_url in &representative.urls {
+            match self.web_reader.fetch(raw_url).await {
+                Ok(Some(content)) => push_web_content(&mut entry, raw_url, &content),
                 Ok(None) => {}
                 Err(err) => {
                     tracing::warn!(
                         target: "web",
                         error = %err,
-                        endpoint = %url_origin_for_log(url),
+                        endpoint = %url::origin_for_log_str(raw_url),
                         "web content fetch failed; classifying message without page content"
                     );
                 }
@@ -410,19 +450,19 @@ impl MessageProcessor {
     }
 
     async fn process_chunk(&self, chunk: Vec<PreparedGroup>, shutdown: &mut ShutdownListener) {
-        let mut prompt_entries = Vec::with_capacity(chunk.len());
+        let mut items = Vec::with_capacity(chunk.len());
         let mut lookup = HashMap::with_capacity(chunk.len());
         for (index, group) in chunk.into_iter().enumerate() {
-            let item_id = format!("item_{index}");
-            let serialized = serde_json::to_string(&group.entry)
-                .unwrap_or_else(|_| "\"메시지 직렬화 실패\"".to_string());
-            prompt_entries.push(format!("{item_id}: {serialized}"));
-            lookup.insert(item_id, group);
+            let id = format!("item_{index}");
+            items.push(ClassificationItem {
+                id: id.clone(),
+                content: group.entry.clone(),
+            });
+            lookup.insert(id, group);
         }
         let expected = lookup.keys().cloned().collect::<HashSet<_>>();
-        let prompt = prompt_entries.join("\n");
 
-        let Some(classification) = self.classify_with_retry(&prompt, &expected, shutdown).await
+        let Some(classification) = self.classify_with_retry(&items, &expected, shutdown).await
         else {
             if !shutdown.is_triggered() {
                 for group in lookup.into_values() {
@@ -444,13 +484,13 @@ impl MessageProcessor {
 
     async fn classify_with_retry(
         &self,
-        prompt: &str,
+        items: &[ClassificationItem],
         expected: &HashSet<String>,
         shutdown: &mut ShutdownListener,
     ) -> Option<ClassificationMap> {
         for attempt in 1..=self.config.processor.retry_attempts {
             let result = tokio::select! {
-                result = self.classifier.classify(prompt) => result,
+                result = self.classifier.classify(items) => result,
                 _ = shutdown.notified() => return None,
             };
             match result {
@@ -463,7 +503,7 @@ impl MessageProcessor {
                         attempt,
                         expected = expected.len(),
                         received = classification.len(),
-                        "Cerebras response keys did not match the request"
+                        "classifier response keys did not match the request"
                     );
                 }
                 Err(err) => {
@@ -471,7 +511,7 @@ impl MessageProcessor {
                         target: "ai",
                         error = %err,
                         attempt,
-                        "Cerebras classification attempt failed"
+                        "classification attempt failed"
                     );
                 }
             }
@@ -500,19 +540,25 @@ impl MessageProcessor {
     ) {
         match initial_action(decision) {
             InitialAction::Confirm => {}
-            InitialAction::Ignore => return,
+            InitialAction::Ignore => {
+                if let Some(fingerprint) = &group.fingerprint {
+                    self.record_ham_decision(fingerprint).await;
+                }
+                return;
+            }
         }
 
-        let expected = HashSet::from(["item_0".to_string()]);
-        let serialized = serde_json::to_string(&group.entry)
-            .unwrap_or_else(|_| "\"메시지 직렬화 실패\"".to_string());
-        let confirmation_prompt = format!("item_0: {serialized}");
+        let expected = HashSet::from([CONFIRMATION_ITEM_ID.to_string()]);
+        let confirmation_items = vec![ClassificationItem {
+            id: CONFIRMATION_ITEM_ID.to_string(),
+            content: group.entry.clone(),
+        }];
         let confirmation = self
-            .classify_with_retry(&confirmation_prompt, &expected, shutdown)
+            .classify_with_retry(&confirmation_items, &expected, shutdown)
             .await;
         let confirmed = confirmation
             .as_ref()
-            .and_then(|classification| classification.get("item_0"));
+            .and_then(|classification| classification.get(CONFIRMATION_ITEM_ID));
         let confirmed = match confirmation_action(confirmed, shutdown.is_triggered()) {
             ConfirmationAction::Delete => {
                 let Some(confirmed) = confirmed else {
@@ -526,6 +572,9 @@ impl MessageProcessor {
                         target: "processor",
                         "isolated spam confirmation rejected the batch decision"
                     );
+                    if let Some(fingerprint) = &group.fingerprint {
+                        self.record_ham_decision(fingerprint).await;
+                    }
                 }
                 return;
             }
@@ -535,10 +584,11 @@ impl MessageProcessor {
             }
         };
 
-        let reason = sanitize_reason(confirmed.reason.as_deref().or(decision.reason.as_deref()));
+        let spam_reason =
+            reason::sanitize(confirmed.reason.as_deref().or(decision.reason.as_deref()));
         let mut evidence_sources = HashSet::new();
         for job in &group.jobs {
-            match self.moderation.delete_spam(job, &reason).await {
+            match self.moderation.delete_spam(job, &spam_reason).await {
                 Ok(()) => {
                     if let Some(source_hash) =
                         MessageFingerprint::evidence_source_hash(job.chat_id.0, job.from_id)
@@ -559,7 +609,7 @@ impl MessageProcessor {
         }
         if let Some(fingerprint) = &group.fingerprint {
             for source_hash in evidence_sources {
-                self.record_spam_decision(fingerprint, &source_hash, &reason)
+                self.record_spam_decision(fingerprint, &source_hash, &spam_reason)
                     .await;
             }
         }
@@ -569,12 +619,9 @@ impl MessageProcessor {
         &self,
         fingerprint: &MessageFingerprint,
         evidence_source_hash: &str,
-        reason: &str,
+        spam_reason: &str,
     ) {
-        let policy = CachePolicy {
-            policy_version: self.config.spam_cache.policy_version.clone(),
-            normalizer_version: self.config.spam_cache.normalizer_version,
-        };
+        let policy = self.cache_policy();
         let result = self
             .decision_store
             .observe_spam(
@@ -582,7 +629,7 @@ impl MessageProcessor {
                 evidence_source_hash,
                 &policy,
                 None,
-                Some(reason),
+                Some(spam_reason),
                 self.config.spam_cache.tentative_ttl,
             )
             .await;
@@ -607,7 +654,7 @@ impl MessageProcessor {
                     confidence: decision.confidence,
                     policy: &policy,
                     evidence_count: decision.evidence_count,
-                    reason: Some(reason),
+                    reason: Some(spam_reason),
                     ttl: self.config.spam_cache.confirmed_ttl,
                 })
                 .await
@@ -634,16 +681,13 @@ impl MessageProcessor {
                 continue;
             }
             job.requeue_count += 1;
-            let priority = if job.priority_score >= 15 {
-                Priority::High
-            } else {
-                Priority::Normal
-            };
+            let priority = priority_for(job.priority_score);
             let chat_id = job.chat_id.0;
             let message_id = job.message_id.0;
-            match self.queue.push(priority, job) {
-                QueuePushOutcome::Enqueued | QueuePushOutcome::DroppedOldestNormal => {}
-                QueuePushOutcome::DroppedNew => {
+            match self.queue.submit(priority, job) {
+                MessageSubmissionOutcome::Enqueued
+                | MessageSubmissionOutcome::DroppedOldestNormal => {}
+                MessageSubmissionOutcome::DroppedNew => {
                     tracing::error!(
                         target: "queue",
                         chat_id,
@@ -654,15 +698,53 @@ impl MessageProcessor {
             }
         }
     }
+}
 
-    async fn write_heartbeat(&self) {
-        if let Err(err) = health::write_heartbeat(&self.heartbeat_path).await {
-            tracing::warn!(
-                target: "health",
-                error = %err,
-                "failed to update processor heartbeat"
-            );
-        }
+fn describe_message(job: &MessageJob, candidate: Option<&FuzzySpamCandidate>) -> String {
+    let member_flag = if job.is_group_member {
+        "멤버"
+    } else {
+        "비멤버"
+    };
+    let mut entry = format!(
+        "[발신자 상태: {}] [우선순위: {}] {}",
+        member_flag, job.priority_score, job.text
+    );
+
+    if let Some(candidate) = candidate {
+        entry.push_str(&format!(
+            "\n과거 유사 스팸 후보: 유사도 {:.0}%, 근거 {}, 신뢰도 {}, 사유 {}",
+            candidate.score * 100.0,
+            candidate.evidence_count,
+            candidate
+                .confidence
+                .map(|value| format!("{:.0}%", value * 100.0))
+                .unwrap_or_else(|| "미기록".to_string()),
+            reason::sanitize(candidate.reason.as_deref())
+        ));
+    }
+
+    entry
+}
+
+fn push_web_content(entry: &mut String, raw_url: &str, content: &WebContent) {
+    entry.push_str("\n웹페이지 정보 (");
+    entry.push_str(&url::redact_for_prompt(raw_url));
+    entry.push_str("):\n");
+    if let Some(title) = &content.title {
+        entry.push_str("제목: ");
+        entry.push_str(title);
+        entry.push('\n');
+    }
+    if let Some(site) = &content.site_name {
+        entry.push_str("사이트: ");
+        entry.push_str(site);
+        entry.push('\n');
+    }
+    if let Some(text) = &content.content {
+        entry.push_str("내용: ");
+        entry.push_str(text);
+        entry.push('\n');
     }
 }
 
@@ -695,66 +777,6 @@ fn classification_keys_match(
         && classification.keys().all(|key| expected.contains(key))
 }
 
-fn format_web_content(content: &WebContent) -> String {
-    let mut out = String::new();
-    if let Some(title) = &content.title {
-        out.push_str("제목: ");
-        out.push_str(title);
-        out.push('\n');
-    }
-    if let Some(site) = &content.site_name {
-        out.push_str("사이트: ");
-        out.push_str(site);
-        out.push('\n');
-    }
-    if let Some(text) = &content.content {
-        out.push_str("내용: ");
-        out.push_str(text);
-        out.push('\n');
-    }
-    out
-}
-
-fn url_for_prompt(raw: &str) -> String {
-    let Ok(mut url) = url::Url::parse(raw) else {
-        return "잘못된 URL".to_string();
-    };
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    url.set_query(None);
-    url.set_fragment(None);
-    url.to_string()
-}
-
-fn url_origin_for_log(raw: &str) -> String {
-    let Ok(url) = url::Url::parse(raw) else {
-        return "invalid-url".to_string();
-    };
-    let Some(host) = url.host_str() else {
-        return url.scheme().to_string();
-    };
-    match url.port() {
-        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
-        None => format!("{}://{}", url.scheme(), host),
-    }
-}
-
-fn sanitize_reason(reason: Option<&str>) -> String {
-    let Some(reason) = reason else {
-        return DEFAULT_REASON.to_string();
-    };
-    let normalized = reason
-        .trim()
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect::<String>();
-    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return DEFAULT_REASON.to_string();
-    }
-    normalized.chars().take(MAX_REASON_CHARS).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -771,13 +793,12 @@ mod tests {
     use chrono::Utc;
     use futures::future::BoxFuture;
     use parking_lot::Mutex;
-    use tempfile::TempDir;
 
     use crate::{
         application::ports::{
-            CachePolicy, CachedDecision, DecisionInput, DecisionState, DecisionVerdict,
-            FuzzySpamCandidate, MessageModerationGateway, SpamClassifier, SpamDecisionStore,
-            WebContentReader,
+            CachePolicy, CachedDecision, ClassificationItem, DecisionInput, DecisionState,
+            DecisionVerdict, FuzzySpamCandidate, HeartbeatReporter, MessageModerationGateway,
+            SpamClassifier, SpamDecisionStore, WebContentReader,
         },
         config::{
             env::{LoggingConfig, ProcessorConfig, ResilienceConfig, SpamCacheConfig},
@@ -787,11 +808,10 @@ mod tests {
             ChatId, ClassificationDecision, ClassificationMap, MessageFingerprint, MessageId,
             MessageJob, WebContent,
         },
-        infrastructure::shutdown::Shutdown,
-        tasks::queue::MessageQueue,
+        infrastructure::{queue::MessageQueue, shutdown::Shutdown},
     };
 
-    use super::{classification_keys_match, url_for_prompt, url_origin_for_log, MessageProcessor};
+    use super::{classification_keys_match, MessageProcessor};
 
     struct FakeClassifier {
         calls: AtomicUsize,
@@ -799,7 +819,10 @@ mod tests {
     }
 
     impl SpamClassifier for FakeClassifier {
-        fn classify<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<ClassificationMap>> {
+        fn classify<'a>(
+            &'a self,
+            _: &'a [ClassificationItem],
+        ) -> BoxFuture<'a, Result<ClassificationMap>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 self.responses
@@ -812,7 +835,9 @@ mod tests {
 
     struct FakeDecisionStore {
         exact_hit: bool,
+        ham_hit: bool,
         evidence_writes: AtomicUsize,
+        ham_writes: AtomicUsize,
     }
 
     impl SpamDecisionStore for FakeDecisionStore {
@@ -891,6 +916,29 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
+        fn find_ham_batch<'a>(
+            &'a self,
+            text_hashes: &'a [String],
+            _: &'a CachePolicy,
+        ) -> BoxFuture<'a, Result<HashSet<String>>> {
+            Box::pin(async move {
+                if !self.ham_hit {
+                    return Ok(HashSet::new());
+                }
+                Ok(text_hashes.iter().cloned().collect())
+            })
+        }
+
+        fn record_ham<'a>(
+            &'a self,
+            _: &'a MessageFingerprint,
+            _: &'a CachePolicy,
+            _: Duration,
+        ) -> BoxFuture<'a, Result<()>> {
+            self.ham_writes.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
         fn prune_expired_batch(&self, _: i64) -> BoxFuture<'_, Result<u64>> {
             Box::pin(async { Ok(0) })
         }
@@ -922,12 +970,19 @@ mod tests {
         }
     }
 
+    struct NoopHeartbeat;
+
+    impl HeartbeatReporter for NoopHeartbeat {
+        fn report(&self) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     struct ProcessorFixture {
         processor: MessageProcessor,
         classifier: Arc<FakeClassifier>,
         store: Arc<FakeDecisionStore>,
         moderation: Arc<FakeModeration>,
-        _temp_dir: TempDir,
     }
 
     fn fixture(
@@ -935,36 +990,45 @@ mod tests {
         responses: Vec<ClassificationMap>,
         deletion_fails: bool,
     ) -> ProcessorFixture {
+        fixture_with_ham(exact_hit, false, responses, deletion_fails)
+    }
+
+    fn fixture_with_ham(
+        exact_hit: bool,
+        ham_hit: bool,
+        responses: Vec<ClassificationMap>,
+        deletion_fails: bool,
+    ) -> ProcessorFixture {
         let config = Arc::new(test_config());
-        let queue = Arc::new(MessageQueue::new(config.queue.clone()));
+        let queue = Arc::new(MessageQueue::<MessageJob>::new(config.queue.clone()));
         let classifier = Arc::new(FakeClassifier {
             calls: AtomicUsize::new(0),
             responses: Mutex::new(responses.into()),
         });
         let store = Arc::new(FakeDecisionStore {
             exact_hit,
+            ham_hit,
             evidence_writes: AtomicUsize::new(0),
+            ham_writes: AtomicUsize::new(0),
         });
         let moderation = Arc::new(FakeModeration {
             fail: deletion_fails,
             deletions: AtomicUsize::new(0),
         });
-        let temp_dir = tempfile::tempdir().expect("temporary processor directory");
         let processor = MessageProcessor::new(
             queue,
             classifier.clone(),
             Arc::new(FakeWebReader),
             store.clone(),
             moderation.clone(),
+            Arc::new(NoopHeartbeat),
             config,
-            temp_dir.path().join("heartbeat"),
         );
         ProcessorFixture {
             processor,
             classifier,
             store,
             moderation,
-            _temp_dir: temp_dir,
         }
     }
 
@@ -1011,6 +1075,7 @@ mod tests {
                 normalizer_version: 1,
                 tentative_ttl: Duration::from_secs(60),
                 confirmed_ttl: Duration::from_secs(60),
+                ham_ttl: Duration::from_secs(60),
                 prune_interval: Duration::from_secs(60),
             },
             web: WebContentConfig {
@@ -1087,6 +1152,76 @@ mod tests {
         assert_eq!(succeeded.store.evidence_writes.load(Ordering::SeqCst), 1);
     }
 
+    fn ham_response() -> ClassificationMap {
+        HashMap::from([(
+            "item_0".to_string(),
+            ClassificationDecision {
+                spam: false,
+                reason: None,
+            },
+        )])
+    }
+
+    #[tokio::test]
+    async fn normal_cache_hit_does_not_call_classifier() {
+        let fixture = fixture_with_ham(false, true, Vec::new(), false);
+        let (_shutdown_signal, mut shutdown) = Shutdown::new();
+
+        fixture
+            .processor
+            .handle_batch(vec![test_job()], &mut shutdown)
+            .await;
+
+        assert_eq!(fixture.classifier.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.moderation.deletions.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.store.ham_writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn normal_classification_is_cached() {
+        let fixture = fixture(false, vec![ham_response()], false);
+        let (_shutdown_signal, mut shutdown) = Shutdown::new();
+
+        fixture
+            .processor
+            .handle_batch(vec![test_job()], &mut shutdown)
+            .await;
+
+        assert_eq!(fixture.classifier.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.moderation.deletions.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.store.ham_writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_confirmation_is_cached_as_normal() {
+        let fixture = fixture(false, vec![spam_response(), ham_response()], false);
+        let (_shutdown_signal, mut shutdown) = Shutdown::new();
+
+        fixture
+            .processor
+            .handle_batch(vec![test_job()], &mut shutdown)
+            .await;
+
+        assert_eq!(fixture.classifier.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.moderation.deletions.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.store.ham_writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn spam_cache_hit_wins_over_normal_cache_hit() {
+        let fixture = fixture_with_ham(true, true, Vec::new(), false);
+        let (_shutdown_signal, mut shutdown) = Shutdown::new();
+
+        fixture
+            .processor
+            .handle_batch(vec![test_job()], &mut shutdown)
+            .await;
+
+        assert_eq!(fixture.classifier.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.moderation.deletions.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.ham_writes.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn requires_every_requested_classification_key() {
         let expected = HashSet::from(["item_0".to_string(), "item_1".to_string()]);
@@ -1107,18 +1242,5 @@ mod tests {
             },
         );
         assert!(classification_keys_match(&classification, &expected));
-    }
-
-    #[test]
-    fn removes_url_credentials_query_and_fragment_from_ai_input() {
-        let value =
-            url_for_prompt("https://user:password@example.com/channel/item?token=secret#fragment");
-        assert_eq!(value, "https://example.com/channel/item");
-    }
-
-    #[test]
-    fn logs_only_url_origin() {
-        let value = url_origin_for_log("https://example.com/private?token=secret#fragment");
-        assert_eq!(value, "https://example.com");
     }
 }

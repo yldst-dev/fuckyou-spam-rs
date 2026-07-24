@@ -6,9 +6,11 @@ use chrono_tz::Tz;
 use futures::future::BoxFuture;
 use teloxide::{prelude::*, types::ParseMode};
 
-use crate::{application::ports::MessageModerationGateway, config::AppConfig, domain::MessageJob};
-
-const DEFAULT_REASON: &str = "모델이 사유를 제공하지 않았습니다.";
+use crate::{
+    application::ports::MessageModerationGateway,
+    config::AppConfig,
+    domain::{reason::DEFAULT_REASON, MessageJob},
+};
 
 pub(crate) struct TelegramMessageModerationGateway {
     bot: Bot,

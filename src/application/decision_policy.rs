@@ -1,8 +1,11 @@
-use crate::domain::ClassificationDecision;
+use crate::{application::ports::DecisionState, domain::ClassificationDecision};
+
+pub(crate) const ACTIVATION_EVIDENCE_THRESHOLD: i64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CacheAction {
     Delete,
+    Skip,
     Classify,
 }
 
@@ -19,9 +22,11 @@ pub(crate) enum ConfirmationAction {
     Requeue,
 }
 
-pub(crate) fn cache_action(is_confirmed_spam: bool) -> CacheAction {
+pub(crate) fn cache_action(is_confirmed_spam: bool, is_confirmed_ham: bool) -> CacheAction {
     if is_confirmed_spam {
         CacheAction::Delete
+    } else if is_confirmed_ham {
+        CacheAction::Skip
     } else {
         CacheAction::Classify
     }
@@ -47,13 +52,21 @@ pub(crate) fn confirmation_action(
     }
 }
 
+pub(crate) fn activation_state(evidence_count: i64) -> DecisionState {
+    if evidence_count >= ACTIVATION_EVIDENCE_THRESHOLD {
+        DecisionState::Active
+    } else {
+        DecisionState::Tentative
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_action, confirmation_action, initial_action, CacheAction, ConfirmationAction,
-        InitialAction,
+        activation_state, cache_action, confirmation_action, initial_action, CacheAction,
+        ConfirmationAction, InitialAction, ACTIVATION_EVIDENCE_THRESHOLD,
     };
-    use crate::domain::ClassificationDecision;
+    use crate::{application::ports::DecisionState, domain::ClassificationDecision};
 
     fn decision(spam: bool) -> ClassificationDecision {
         ClassificationDecision { spam, reason: None }
@@ -61,12 +74,22 @@ mod tests {
 
     #[test]
     fn confirmed_cache_hit_deletes_without_classification() {
-        assert_eq!(cache_action(true), CacheAction::Delete);
+        assert_eq!(cache_action(true, false), CacheAction::Delete);
     }
 
     #[test]
     fn cache_miss_requires_classification() {
-        assert_eq!(cache_action(false), CacheAction::Classify);
+        assert_eq!(cache_action(false, false), CacheAction::Classify);
+    }
+
+    #[test]
+    fn known_normal_message_skips_classification() {
+        assert_eq!(cache_action(false, true), CacheAction::Skip);
+    }
+
+    #[test]
+    fn spam_wins_over_a_stale_normal_cache_entry() {
+        assert_eq!(cache_action(true, true), CacheAction::Delete);
     }
 
     #[test]
@@ -102,5 +125,29 @@ mod tests {
             ConfirmationAction::Requeue
         );
         assert_eq!(confirmation_action(None, true), ConfirmationAction::Ignore);
+    }
+
+    #[test]
+    fn evidence_below_threshold_stays_tentative() {
+        assert_eq!(
+            activation_state(ACTIVATION_EVIDENCE_THRESHOLD - 1),
+            DecisionState::Tentative
+        );
+    }
+
+    #[test]
+    fn evidence_at_threshold_activates() {
+        assert_eq!(
+            activation_state(ACTIVATION_EVIDENCE_THRESHOLD),
+            DecisionState::Active
+        );
+    }
+
+    #[test]
+    fn evidence_above_threshold_activates() {
+        assert_eq!(
+            activation_state(ACTIVATION_EVIDENCE_THRESHOLD + 1),
+            DecisionState::Active
+        );
     }
 }

@@ -5,9 +5,7 @@ mod config;
 mod db;
 mod domain;
 mod infrastructure;
-mod tasks;
 mod telegram;
-mod web_content;
 
 use anyhow::Result;
 use infrastructure::{directories, health, instance_guard, logging, shutdown};
@@ -16,12 +14,19 @@ use infrastructure::{directories, health, instance_guard, logging, shutdown};
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
-    let config = config::load_config()?;
+    let config::LoadedConfig { config, warnings } = config::load_config()?;
     let paths = directories::ensure_directories(&config.directories)?;
     if std::env::args().nth(1).as_deref() == Some("healthcheck") {
         return health::check(&paths).await;
     }
     logging::init_tracing(&config, &paths)?;
+    for key in warnings {
+        tracing::warn!(
+            target: "config",
+            key,
+            "invalid environment variable value; default applied"
+        );
+    }
     let _instance_guard = instance_guard::InstanceGuard::acquire(&paths)?;
 
     let (shutdown, _) = shutdown::Shutdown::new();

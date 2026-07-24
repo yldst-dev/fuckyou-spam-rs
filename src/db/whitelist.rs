@@ -54,7 +54,7 @@ impl WhitelistRepository {
 
     pub(crate) async fn list(&self) -> Result<Vec<WhitelistRow>> {
         let rows = query_as::<_, WhitelistRow>(
-            r#"SELECT chat_id, chat_title, chat_type, added_at, added_by FROM whitelist ORDER BY added_at DESC"#,
+            r#"SELECT chat_id, chat_title, added_at FROM whitelist ORDER BY added_at DESC"#,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -85,9 +85,7 @@ impl<'r> FromRow<'r, SqliteRow> for WhitelistRow {
         Ok(Self {
             chat_id: row.try_get("chat_id")?,
             chat_title: row.try_get("chat_title")?,
-            chat_type: row.try_get("chat_type")?,
             added_at: row.try_get("added_at")?,
-            added_by: row.try_get("added_by")?,
         })
     }
 }

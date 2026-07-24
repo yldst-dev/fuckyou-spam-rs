@@ -35,6 +35,13 @@ static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| Migrator {
             include_str!("../../migrations/0003_security_hardening.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            4,
+            Cow::Borrowed("ham cache"),
+            MigrationType::Simple,
+            include_str!("../../migrations/0004_ham_cache.sql").into_sql_str(),
+            false,
+        ),
     ]),
     ..Migrator::DEFAULT
 });
