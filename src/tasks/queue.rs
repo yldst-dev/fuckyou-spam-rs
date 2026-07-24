@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 use crate::{config::QueueConfig, domain::types::QueueSnapshot};
 
@@ -18,6 +19,7 @@ pub struct QueueLimits {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[must_use]
 pub enum QueuePushOutcome {
     Enqueued,
     DroppedNew,
@@ -29,6 +31,7 @@ pub struct MessageQueue<T> {
     high: Mutex<VecDeque<T>>,
     normal: Mutex<VecDeque<T>>,
     limits: QueueLimits,
+    notify: Notify,
 }
 
 impl<T> MessageQueue<T> {
@@ -37,6 +40,7 @@ impl<T> MessageQueue<T> {
             high: Mutex::new(VecDeque::new()),
             normal: Mutex::new(VecDeque::new()),
             limits: QueueLimits::from(config),
+            notify: Notify::new(),
         }
     }
 
@@ -44,7 +48,7 @@ impl<T> MessageQueue<T> {
         let mut high = self.high.lock();
         let mut normal = self.normal.lock();
         let current_total = high.len() + normal.len();
-        match priority {
+        let outcome = match priority {
             Priority::High => {
                 if high.len() < self.limits.high_priority_max
                     && current_total < self.limits.max_messages
@@ -94,16 +98,42 @@ impl<T> MessageQueue<T> {
                     QueuePushOutcome::DroppedNew
                 }
             }
+        };
+        drop(normal);
+        drop(high);
+        if !matches!(outcome, QueuePushOutcome::DroppedNew) {
+            self.notify.notify_one();
         }
+        outcome
     }
 
+    #[cfg(test)]
     pub fn drain_ordered(&self) -> Vec<T> {
-        let mut drained = Vec::new();
+        self.drain_ordered_limit(usize::MAX)
+    }
+
+    pub fn drain_ordered_limit(&self, max_items: usize) -> Vec<T> {
+        let mut drained = Vec::with_capacity(max_items.min(self.limits.max_messages));
+        if max_items == 0 {
+            return drained;
+        }
         let mut high = self.high.lock();
         let mut normal = self.normal.lock();
-        drained.extend(high.drain(..));
-        drained.extend(normal.drain(..));
+        let high_count = high.len().min(max_items);
+        drained.extend(high.drain(..high_count));
+        let normal_count = normal.len().min(max_items - high_count);
+        drained.extend(normal.drain(..normal_count));
         drained
+    }
+
+    pub async fn wait_for_items(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if !self.is_empty() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn snapshot(&self) -> QueueSnapshot {
@@ -113,6 +143,12 @@ impl<T> MessageQueue<T> {
             high_priority: high.len(),
             normal_priority: normal.len(),
         }
+    }
+
+    fn is_empty(&self) -> bool {
+        let high = self.high.lock();
+        let normal = self.normal.lock();
+        high.is_empty() && normal.is_empty()
     }
 }
 
@@ -171,8 +207,8 @@ mod tests {
     fn high_priority_drops_oldest_normal_when_total_capacity_is_full() {
         let queue = MessageQueue::new(queue_config(2, 2, 2));
 
-        queue.push(Priority::Normal, 1);
-        queue.push(Priority::Normal, 2);
+        let _ = queue.push(Priority::Normal, 1);
+        let _ = queue.push(Priority::Normal, 2);
         assert!(matches!(
             queue.push(Priority::High, 3),
             QueuePushOutcome::DroppedOldestNormal
@@ -185,13 +221,51 @@ mod tests {
     fn rejects_high_when_high_capacity_is_full() {
         let queue = MessageQueue::new(queue_config(3, 1, 3));
 
-        queue.push(Priority::High, 1);
-        queue.push(Priority::Normal, 2);
+        let _ = queue.push(Priority::High, 1);
+        let _ = queue.push(Priority::Normal, 2);
         assert!(matches!(
             queue.push(Priority::High, 3),
             QueuePushOutcome::DroppedNew
         ));
 
         assert_eq!(queue.drain_ordered(), vec![1, 2]);
+    }
+
+    #[test]
+    fn drains_a_limited_priority_ordered_batch() {
+        let queue = MessageQueue::new(queue_config(5, 3, 3));
+
+        let _ = queue.push(Priority::Normal, 1);
+        let _ = queue.push(Priority::Normal, 2);
+        let _ = queue.push(Priority::High, 3);
+        let _ = queue.push(Priority::High, 4);
+
+        assert_eq!(queue.drain_ordered_limit(3), vec![3, 4, 1]);
+        assert_eq!(queue.drain_ordered_limit(3), vec![2]);
+    }
+
+    #[test]
+    fn zero_limit_does_not_drain() {
+        let queue = MessageQueue::new(queue_config(2, 2, 2));
+
+        let _ = queue.push(Priority::Normal, 1);
+
+        assert!(queue.drain_ordered_limit(0).is_empty());
+        assert_eq!(queue.drain_ordered(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn waits_until_an_item_is_enqueued() {
+        let queue = std::sync::Arc::new(MessageQueue::new(queue_config(2, 2, 2)));
+        let waiting_queue = queue.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_queue.wait_for_items().await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        let _ = queue.push(Priority::Normal, 1);
+        waiter.await.unwrap();
     }
 }

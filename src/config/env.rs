@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{net::IpAddr, time::Duration};
 
 use thiserror::Error;
 
@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub timezone: String,
     pub scheduler: SchedulerConfig,
     pub queue: QueueConfig,
+    pub processor: ProcessorConfig,
     pub spam_cache: SpamCacheConfig,
     pub web: WebContentConfig,
     pub resilience: ResilienceConfig,
@@ -23,8 +24,9 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone)]
 pub struct CerebrasConfig {
-    pub api_key: Option<String>,
+    pub api_key: String,
     pub model: String,
+    pub request_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +39,7 @@ pub struct DirectoryConfig {
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
     pub level: String,
+    pub file_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -52,10 +55,25 @@ pub struct QueueConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProcessorConfig {
+    pub batch_max_messages: usize,
+    pub batch_max_chars: usize,
+    pub retry_attempts: u32,
+    pub max_requeues: u32,
+    pub retry_base_delay: Duration,
+    pub web_fetch_concurrency: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct SpamCacheConfig {
     pub similarity_threshold: f64,
     pub scan_limit: i64,
     pub min_normalized_chars: usize,
+    pub policy_version: String,
+    pub normalizer_version: i64,
+    pub tentative_ttl: Duration,
+    pub confirmed_ttl: Duration,
+    pub prune_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +82,7 @@ pub struct WebContentConfig {
     pub fetch_timeout: Duration,
     pub response_max_bytes: usize,
     pub content_max_length: usize,
+    pub blocked_ips: Vec<IpAddr>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,4 +110,6 @@ pub struct UpdateConfig {
 pub enum ConfigError {
     #[error("missing required environment variable: {0}")]
     Missing(&'static str),
+    #[error("invalid environment variable: {0}")]
+    Invalid(&'static str),
 }

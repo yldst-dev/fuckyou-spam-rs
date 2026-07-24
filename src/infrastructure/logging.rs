@@ -15,19 +15,20 @@ pub fn init_tracing(config: &AppConfig, paths: &ResolvedPaths) -> Result<()> {
             .or_else(|_| EnvFilter::try_new(&config.logging.level))
             .unwrap_or_else(|_| EnvFilter::new("info"));
 
-        let file_appender = tracing_appender::rolling::daily(&paths.logs_dir, "bot.log");
-        let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
-        let _ = GUARD.set(guard);
-
         let console_layer = fmt::layer()
             .with_writer(io::stdout)
             .with_target(true)
             .with_ansi(true);
 
-        let file_layer = fmt::layer()
-            .with_writer(file_writer)
-            .with_target(true)
-            .with_ansi(false);
+        let file_layer = config.logging.file_enabled.then(|| {
+            let file_appender = tracing_appender::rolling::daily(&paths.logs_dir, "bot.log");
+            let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+            let _ = GUARD.set(guard);
+            fmt::layer()
+                .with_writer(file_writer)
+                .with_target(true)
+                .with_ansi(false)
+        });
 
         tracing_subscriber::registry()
             .with(env_filter)
@@ -35,7 +36,11 @@ pub fn init_tracing(config: &AppConfig, paths: &ResolvedPaths) -> Result<()> {
             .with(file_layer)
             .init();
 
-        tracing::info!(logs = %paths.logs_dir.display(), "tracing initialized");
+        tracing::info!(
+            file_logging = config.logging.file_enabled,
+            logs = %paths.logs_dir.display(),
+            "tracing initialized"
+        );
         Ok(())
     })?;
     Ok(())

@@ -1,14 +1,11 @@
-use std::{env, path::PathBuf, process, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::Utc;
 use chrono_tz::Tz;
 use reqwest::Client;
 use teloxide::prelude::*;
-use tokio::{
-    task::JoinHandle,
-    time::{sleep, timeout},
-};
+use tokio::{task::JoinHandle, time::timeout};
 use tokio_cron_scheduler::JobScheduler;
 
 use crate::{
@@ -31,7 +28,7 @@ use crate::{
 pub struct SpamGuardApp {
     _paths: ResolvedPaths,
     scheduler: JobScheduler,
-    processor_handle: JoinHandle<()>,
+    processor_handle: JoinHandle<Result<()>>,
     telegram: TelegramService,
     whitelist: Arc<WhitelistRepository>,
     shutdown: Shutdown,
@@ -52,13 +49,11 @@ impl SpamGuardApp {
 
         let http_client = Client::builder()
             .user_agent(format!("fuckyou-spam-rust/{}", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(10))
             .build()?;
 
-        let cerebras = Arc::new(CerebrasClient::new(
-            http_client.clone(),
-            config.cerebras.clone(),
-        ));
-        let web_fetcher = Arc::new(WebContentFetcher::new(http_client, config.web.clone())?);
+        let cerebras = Arc::new(CerebrasClient::new(http_client, config.cerebras.clone()));
+        let web_fetcher = Arc::new(WebContentFetcher::new(config.web.clone())?);
 
         let bot = Bot::new(&config.telegram_bot_token);
         let queue = Arc::new(MessageQueue::<MessageJob>::new(config.queue.clone()));
@@ -68,7 +63,7 @@ impl SpamGuardApp {
         };
 
         let restart_callback =
-            build_restart_callback(bot.clone(), config.clone(), whitelist.clone());
+            build_restart_callback(bot.clone(), config.clone(), shutdown.clone());
         let telegram = TelegramService::new(
             bot.clone(),
             config.clone(),
@@ -85,6 +80,7 @@ impl SpamGuardApp {
             web_fetcher,
             spam_cache,
             config.clone(),
+            crate::infrastructure::health::heartbeat_path(&paths),
         ));
         let processor_handle = processor.clone().spawn(shutdown.subscribe());
 
@@ -120,9 +116,11 @@ impl SpamGuardApp {
         notify_admin_group(&bot, config.as_ref(), "스팸 감지 봇이 시작되었습니다.").await;
 
         let mut shutdown_listener = shutdown.subscribe();
-        let shutdown_timeout = Duration::from_secs(5);
+        let shutdown_timeout = Duration::from_secs(15);
         let mut telegram_future = Box::pin(telegram.run(shutdown.subscribe()));
         let mut telegram_completed = false;
+        let mut processor_completed = false;
+        let mut runtime_error = None;
 
         tokio::select! {
             _ = shutdown_listener.notified() => {
@@ -132,9 +130,25 @@ impl SpamGuardApp {
                 telegram_completed = true;
                 if let Err(err) = res {
                     tracing::error!(?err, "Telegram dispatcher 종료 중 오류");
+                    runtime_error = Some(anyhow!("Telegram dispatcher failed: {err}"));
                 } else {
                     tracing::info!("Telegram dispatcher 정상 종료");
+                    runtime_error = Some(anyhow!("Telegram dispatcher stopped unexpectedly"));
                 }
+            }
+            res = &mut processor_handle => {
+                processor_completed = true;
+                let error = match res {
+                    Ok(Ok(())) => anyhow!("message processor stopped unexpectedly"),
+                    Ok(Err(err)) => anyhow!("message processor failed: {err}"),
+                    Err(err) => anyhow!("message processor task failed: {err}"),
+                };
+                tracing::error!(
+                    target: "processor",
+                    error = %error,
+                    "message processor stopped while the application was running"
+                );
+                runtime_error = Some(error);
             }
         }
 
@@ -173,23 +187,29 @@ impl SpamGuardApp {
             }
         }
 
-        let processor_sleep = tokio::time::sleep(shutdown_timeout);
-        tokio::pin!(processor_sleep);
-        tokio::select! {
-            res = &mut processor_handle => {
-                if let Err(err) = res {
-                    if err.is_panic() {
-                        tracing::error!("메시지 처리기 작업이 패닉으로 종료되었습니다");
+        if !processor_completed {
+            let processor_sleep = tokio::time::sleep(shutdown_timeout);
+            tokio::pin!(processor_sleep);
+            tokio::select! {
+                res = &mut processor_handle => {
+                    match res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            tracing::error!(error = %err, "메시지 처리기 종료 중 오류");
+                        }
+                        Err(err) => {
+                            tracing::error!(error = %err, "메시지 처리기 작업 종료 실패");
+                        }
                     }
                 }
-            }
-            _ = &mut processor_sleep => {
-                tracing::warn!(
-                    target: "processor",
-                    "메시지 처리기 종료가 {:?} 내에 완료되지 않아 작업을 중단합니다",
-                    shutdown_timeout
-                );
-                processor_handle.abort();
+                _ = &mut processor_sleep => {
+                    tracing::warn!(
+                        target: "processor",
+                        "메시지 처리기 종료가 {:?} 내에 완료되지 않아 작업을 중단합니다",
+                        shutdown_timeout
+                    );
+                    processor_handle.abort();
+                }
             }
         }
 
@@ -203,70 +223,25 @@ impl SpamGuardApp {
 
         tracing::info!("봇 종료 완료");
         notify_admin_group(&bot, config.as_ref(), "스팸 감지 봇이 종료되었습니다.").await;
-        Ok(())
+        if let Some(error) = runtime_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 }
 
-fn build_restart_callback(
-    bot: Bot,
-    config: Arc<AppConfig>,
-    whitelist: Arc<WhitelistRepository>,
-) -> RestartCallback {
+fn build_restart_callback(bot: Bot, config: Arc<AppConfig>, shutdown: Shutdown) -> RestartCallback {
     Arc::new(move || {
         let bot = bot.clone();
         let config = config.clone();
-        let whitelist = whitelist.clone();
-        let mut arg_iter = env::args();
-        let restart_cmd_path = arg_iter.next().map(PathBuf::from);
-        let restart_args: Vec<String> = arg_iter.collect();
+        let shutdown = shutdown.clone();
         tokio::spawn(async move {
             let tz: Tz = config.timezone.parse().unwrap_or(chrono_tz::Asia::Seoul);
             let ts = Utc::now().with_timezone(&tz).format("%Y-%m-%d %H:%M:%S");
             let message = format!("자동 재부팅을 시작합니다.\n현재 시각: {ts}");
             notify_admin_group(&bot, config.as_ref(), &message).await;
-            whitelist.close().await;
-            sleep(Duration::from_secs(5)).await;
-            let restart_target = restart_cmd_path.or_else(|| env::current_exe().ok());
-            let Some(executable) = restart_target else {
-                tracing::error!(target: "scheduler", "failed to determine executable path for restart");
-                notify_admin_group(
-                    &bot,
-                    config.as_ref(),
-                    "자동 재부팅 실패: 실행 파일 경로를 찾을 수 없습니다.",
-                )
-                .await;
-                return;
-            };
-
-            tracing::info!(
-                target: "scheduler",
-                command = %executable.display(),
-                args_count = restart_args.len(),
-                "spawning replacement process for restart",
-            );
-
-            let mut command = process::Command::new(&executable);
-            if !restart_args.is_empty() {
-                command.args(&restart_args);
-            }
-
-            if let Err(err) = command.spawn() {
-                tracing::error!(
-                    target: "scheduler",
-                    command = %executable.display(),
-                    ?err,
-                    "failed to spawn replacement process",
-                );
-                notify_admin_group(
-                    &bot,
-                    config.as_ref(),
-                    "자동 재부팅 실패: 새 프로세스를 시작할 수 없습니다.",
-                )
-                .await;
-                return;
-            }
-
-            process::exit(0);
+            shutdown.trigger();
         });
     })
 }

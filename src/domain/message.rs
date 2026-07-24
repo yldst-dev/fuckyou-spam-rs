@@ -8,10 +8,10 @@ pub struct MessageJob {
     pub message_id: MessageId,
     pub from_id: Option<i64>,
     pub from_display: String,
-    pub username: Option<String>,
     pub text: String,
     pub urls: Vec<String>,
     pub is_group_member: bool,
     pub priority_score: i32,
     pub timestamp: DateTime<Utc>,
+    pub requeue_count: u32,
 }

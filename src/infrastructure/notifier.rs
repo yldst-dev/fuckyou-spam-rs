@@ -2,7 +2,6 @@ use teloxide::{prelude::*, types::ParseMode};
 
 use crate::config::AppConfig;
 
-/// Sends a message to the configured admin group, logging a warning on failure.
 pub async fn notify_admin_group(bot: &Bot, config: &AppConfig, text: &str) {
     if let Some(admin_group_id) = config.admin_group_id {
         if admin_group_id == 0 {

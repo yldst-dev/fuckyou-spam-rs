@@ -2,24 +2,36 @@ services:
   spam-bot:
     build:
       context: .
-    image: fuckyou-spam-rust:latest
     restart: unless-stopped
-    stop_grace_period: 30s
+    stop_grace_period: 60s
     init: true
     env_file:
       - .env
     environment:
-      - SKIP_PROCESS_GUARD=1
+      AUTO_UPDATE_ENABLED: "false"
+      DATA_DIR: /app/data
+      LOG_TO_FILE: "false"
+      LOGS_DIR: /tmp/logs
+      RESTART_CRONS: ""
+      WEBPAGE_BLOCKED_IPS: "${WEBPAGE_BLOCKED_IPS:-}"
     read_only: true
+    cpus: "1.0"
+    mem_limit: 512m
+    pids_limit: 128
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=16m
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
     volumes:
       - bot-data:/app/data
-      - bot-logs:/app/logs
+    healthcheck:
+      test: ["CMD", "./fuckyou-spam-rust", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     logging:
       driver: json-file
       options:
@@ -28,4 +40,3 @@ services:
 
 volumes:
   bot-data:
-  bot-logs:

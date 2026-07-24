@@ -18,11 +18,14 @@ use crate::{
     db::whitelist::{WhitelistEntry, WhitelistRepository},
     domain::MessageJob,
     infrastructure::{notifier::notify_admin_group, shutdown::ShutdownListener},
-    tasks::{queue::MessageQueue, scheduler::RestartCallback},
+    tasks::{
+        queue::{MessageQueue, QueuePushOutcome},
+        scheduler::RestartCallback,
+    },
 };
 
 use super::{
-    types::{is_group_member, AppState, BotResult, GeneralCommand, QueueSnapshotProvider},
+    types::{AppState, BotResult, GeneralCommand, MessageRateLimitOutcome, QueueSnapshotProvider},
     utils::{admin_command_list, calc_priority, extract_urls, format_user_display, user_to_i64},
 };
 
@@ -219,12 +222,7 @@ impl TelegramService {
         queue_snapshot: QueueSnapshotProvider,
         restart_callback: RestartCallback,
     ) -> Self {
-        let state = Arc::new(AppState {
-            config,
-            whitelist,
-            queue,
-            queue_snapshot,
-        });
+        let state = Arc::new(AppState::new(config, whitelist, queue, queue_snapshot));
         Self {
             bot,
             state,
@@ -269,7 +267,11 @@ impl TelegramService {
         let mut dispatcher = Dispatcher::builder(self.bot.clone(), handler)
             .dependencies(dptree::deps![self.state.clone()])
             .default_handler(|update| async move {
-                tracing::debug!(target: "telegram", ?update, "unhandled update");
+                tracing::debug!(
+                    target: "telegram",
+                    update_id = update.id.0,
+                    "unhandled Telegram update"
+                );
             })
             .build();
 
@@ -309,18 +311,22 @@ impl TelegramService {
     }
 
     async fn on_plain_message(bot: Bot, msg: Message, state: Arc<AppState>) -> BotResult<()> {
-        if let Some(text) = msg.text() {
-            if Self::maybe_handle_admin_command(&bot, &msg, text, state.clone()).await? {
-                return Ok(());
-            }
-        }
-
         if msg.chat.is_private() {
             return Ok(());
         }
 
         if !state.is_chat_allowed(msg.chat.id.0).await {
             return Ok(());
+        }
+
+        if !Self::allow_message(&msg, state.as_ref()) {
+            return Ok(());
+        }
+
+        if let Some(text) = msg.text() {
+            if Self::maybe_handle_admin_command(&bot, &msg, text, state.clone()).await? {
+                return Ok(());
+            }
         }
 
         let text = msg
@@ -334,12 +340,11 @@ impl TelegramService {
         let from_display = from
             .map(format_user_display)
             .unwrap_or_else(|| "Unknown".to_string());
-        let username = from.and_then(|u| u.username.clone());
         let raw_user_id = from.map(|u| u.id);
         let from_id = from.map(user_to_i64);
 
         let is_group_member = if let Some(user_id) = raw_user_id {
-            is_group_member(&bot, msg.chat.id, user_id).await
+            state.is_group_member(&bot, msg.chat.id, user_id).await
         } else {
             false
         };
@@ -352,15 +357,45 @@ impl TelegramService {
             message_id: msg.id,
             from_id,
             from_display,
-            username,
             text,
             urls,
             is_group_member,
             priority_score,
             timestamp: msg.date,
+            requeue_count: 0,
         };
 
-        state.queue.push(priority, job);
+        let chat_id = job.chat_id.0;
+        let message_id = job.message_id.0;
+        match state.queue.push(priority, job) {
+            QueuePushOutcome::Enqueued => {
+                tracing::debug!(
+                    target: "queue",
+                    chat_id,
+                    message_id,
+                    priority_score,
+                    "message job enqueued"
+                );
+            }
+            QueuePushOutcome::DroppedNew => {
+                tracing::warn!(
+                    target: "queue",
+                    chat_id,
+                    message_id,
+                    priority_score,
+                    "message job dropped before spam classification"
+                );
+            }
+            QueuePushOutcome::DroppedOldestNormal => {
+                tracing::warn!(
+                    target: "queue",
+                    chat_id,
+                    message_id,
+                    priority_score,
+                    "high-priority message enqueued after dropping oldest normal-priority job"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -370,6 +405,10 @@ impl TelegramService {
         cmd: GeneralCommand,
         state: Arc<AppState>,
     ) -> BotResult<()> {
+        if !Self::allow_message(&msg, state.as_ref()) {
+            return Ok(());
+        }
+
         match cmd {
             GeneralCommand::Start => {
                 let allowed = state.is_chat_allowed(msg.chat.id.0).await;
@@ -419,6 +458,34 @@ impl TelegramService {
             }
         };
         Ok(())
+    }
+
+    fn allow_message(msg: &Message, state: &AppState) -> bool {
+        let user_id = msg.from.as_ref().map(user_to_i64);
+        match state.check_message_rate(msg.chat.id.0, user_id) {
+            MessageRateLimitOutcome::Allowed => true,
+            MessageRateLimitOutcome::UserLimited { report } => {
+                if report {
+                    tracing::warn!(
+                        target: "telegram",
+                        chat_id = msg.chat.id.0,
+                        user_id,
+                        "Telegram message rate limit reached for user"
+                    );
+                }
+                false
+            }
+            MessageRateLimitOutcome::ChatLimited { report } => {
+                if report {
+                    tracing::warn!(
+                        target: "telegram",
+                        chat_id = msg.chat.id.0,
+                        "Telegram message rate limit reached for chat"
+                    );
+                }
+                false
+            }
+        }
     }
 
     async fn maybe_handle_admin_command(
@@ -520,7 +587,7 @@ impl TelegramService {
                     chat_type: Some(format!("{:?}", chat_info.kind)),
                     added_by: msg.from.as_ref().map(user_to_i64),
                 };
-                match state.whitelist.add_or_replace(entry).await {
+                match state.whitelist.add(entry).await {
                     Ok(true) => {
                         tracing::info!(
                             target: "admin",
@@ -561,7 +628,6 @@ impl TelegramService {
             return Ok(());
         };
 
-        // Only handle ban actions from the admin group
         let Some(message) = q.message else {
             return Ok(());
         };

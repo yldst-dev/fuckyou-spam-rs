@@ -57,8 +57,6 @@ mod unix {
 
     use super::USER_AGENT;
 
-    const CHECKSUM_MAX_BYTES: u64 = 4096;
-
     pub(super) async fn auto_update_on_startup(
         config: &AppConfig,
         paths: &ResolvedPaths,
@@ -193,8 +191,7 @@ mod unix {
             &asset.browser_download_url,
             &config.update.allowed_asset_hosts,
         )?;
-        let expected_sha256 =
-            expected_sha256(client, config, &release, platform.asset_name).await?;
+        let expected_sha256 = expected_sha256(config)?;
 
         tracing::info!(
             target: "update",
@@ -278,73 +275,13 @@ mod unix {
             .context("임시 업데이트 디렉터리를 생성할 수 없습니다")
     }
 
-    async fn expected_sha256(
-        client: &Client,
-        config: &AppConfig,
-        release: &ReleaseResponse,
-        asset_name: &str,
-    ) -> Result<[u8; 32]> {
-        if let Some(value) = &config.update.asset_sha256 {
-            return parse_sha256_hex(value);
-        }
-
-        let checksum_name = format!("{}.sha256", asset_name);
-        let checksum_asset = release
-            .assets
-            .iter()
-            .find(|asset| asset.name == checksum_name)
-            .ok_or_else(|| anyhow!("릴리스 자산 {} 를 찾을 수 없습니다", checksum_name))?;
-        validate_allowed_host(
-            &checksum_asset.browser_download_url,
-            &config.update.allowed_asset_hosts,
-        )?;
-        let text = download_text_limited(
-            client,
-            &checksum_asset.browser_download_url,
-            CHECKSUM_MAX_BYTES,
-            &config.update.allowed_asset_hosts,
-        )
-        .await?;
-        let checksum = text
-            .split_whitespace()
-            .find(|part| part.len() == 64 && part.chars().all(|ch| ch.is_ascii_hexdigit()))
-            .ok_or_else(|| anyhow!("{} 에서 SHA-256 값을 찾을 수 없습니다", checksum_name))?;
-        parse_sha256_hex(checksum)
-    }
-
-    async fn download_text_limited(
-        client: &Client,
-        url: &str,
-        max_bytes: u64,
-        allowed_hosts: &[String],
-    ) -> Result<String> {
-        validate_allowed_host(url, allowed_hosts)?;
-        let mut response = get_with_allowed_redirects(client, url, allowed_hosts).await?;
-        if let Some(length) = response.content_length() {
-            if length > max_bytes {
-                return Err(anyhow!(
-                    "다운로드 크기 {} 가 제한 {} 를 초과했습니다",
-                    length,
-                    max_bytes
-                ));
-            }
-        }
-        let mut bytes = Vec::new();
-        let mut downloaded = 0u64;
-        while let Some(chunk) = response.chunk().await? {
-            downloaded = downloaded
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| anyhow!("다운로드 크기를 계산할 수 없습니다"))?;
-            if downloaded > max_bytes {
-                return Err(anyhow!(
-                    "다운로드 크기 {} 가 제한 {} 를 초과했습니다",
-                    downloaded,
-                    max_bytes
-                ));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        String::from_utf8(bytes).context("체크섬 파일이 UTF-8 형식이 아닙니다")
+    fn expected_sha256(config: &AppConfig) -> Result<[u8; 32]> {
+        let value = config
+            .update
+            .asset_sha256
+            .as_deref()
+            .ok_or_else(|| anyhow!("AUTO_UPDATE_ASSET_SHA256 값이 필요합니다"))?;
+        parse_sha256_hex(value)
     }
 
     async fn download_asset(

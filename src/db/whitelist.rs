@@ -18,10 +18,11 @@ impl WhitelistRepository {
         self.pool.close().await;
     }
 
-    pub async fn add_or_replace(&self, entry: WhitelistEntry) -> Result<bool> {
+    pub async fn add(&self, entry: WhitelistEntry) -> Result<bool> {
         let affected = query(
-            r#"INSERT OR REPLACE INTO whitelist (chat_id, chat_title, chat_type, added_by)
-                VALUES (?1, ?2, ?3, ?4)"#,
+            r#"INSERT INTO whitelist (chat_id, chat_title, chat_type, added_by)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(chat_id) DO NOTHING"#,
         )
         .bind(entry.chat_id)
         .bind(entry.chat_title)
@@ -87,5 +88,32 @@ impl<'r> FromRow<'r, SqliteRow> for WhitelistRow {
             added_at: row.try_get("added_at")?,
             added_by: row.try_get("added_by")?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use tempfile::tempdir;
+
+    use crate::db;
+
+    use super::{WhitelistEntry, WhitelistRepository};
+
+    #[tokio::test]
+    async fn reports_duplicate_addition() -> Result<()> {
+        let dir = tempdir()?;
+        let pool = db::init_pool(&dir.path().join("whitelist.db")).await?;
+        let repository = WhitelistRepository::new(pool);
+        let entry = WhitelistEntry {
+            chat_id: -1001,
+            chat_title: Some("group".to_string()),
+            chat_type: Some("Supergroup".to_string()),
+            added_by: Some(1),
+        };
+
+        assert!(repository.add(entry.clone()).await?);
+        assert!(!repository.add(entry).await?);
+        Ok(())
     }
 }

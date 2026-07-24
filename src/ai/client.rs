@@ -17,12 +17,6 @@ impl CerebrasClient {
     }
 
     pub async fn classify(&self, prompt: &str) -> Result<ClassificationMap> {
-        let api_key = self
-            .config
-            .api_key
-            .as_ref()
-            .context("CEREBRAS_API_KEY must be configured for spam classification")?;
-
         let request = build_request(self.config.model.clone(), prompt);
 
         tracing::debug!(
@@ -34,7 +28,8 @@ impl CerebrasClient {
         let http_response = self
             .http
             .post(CEREBRAS_API_URL)
-            .bearer_auth(api_key)
+            .timeout(self.config.request_timeout)
+            .bearer_auth(&self.config.api_key)
             .json(&request)
             .send()
             .await?;

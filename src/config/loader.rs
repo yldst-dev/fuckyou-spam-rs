@@ -1,8 +1,9 @@
-use std::env;
+use std::{env, net::IpAddr};
 
 use super::env::{
-    AppConfig, CerebrasConfig, ConfigError, DirectoryConfig, LoggingConfig, QueueConfig,
-    ResilienceConfig, SchedulerConfig, SpamCacheConfig, UpdateConfig, WebContentConfig,
+    AppConfig, CerebrasConfig, ConfigError, DirectoryConfig, LoggingConfig, ProcessorConfig,
+    QueueConfig, ResilienceConfig, SchedulerConfig, SpamCacheConfig, UpdateConfig,
+    WebContentConfig,
 };
 
 pub fn load_config() -> Result<AppConfig, ConfigError> {
@@ -27,9 +28,14 @@ impl AppConfig {
             })
             .unwrap_or_default();
 
+        let cerebras_api_key = required_non_empty("CEREBRAS_API_KEY")?;
         let cerebras = CerebrasConfig {
-            api_key: env::var("CEREBRAS_API_KEY").ok().filter(|v| !v.is_empty()),
+            api_key: cerebras_api_key,
             model: env::var("CEREBRAS_MODEL").unwrap_or_else(|_| "gpt-oss-120b".to_string()),
+            request_timeout: std::time::Duration::from_secs(parse_u64_env(
+                "CEREBRAS_REQUEST_TIMEOUT_SECS",
+                45,
+            )),
         };
 
         let directories = DirectoryConfig {
@@ -40,6 +46,7 @@ impl AppConfig {
 
         let logging = LoggingConfig {
             level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string()),
+            file_enabled: parse_bool_env("LOG_TO_FILE").unwrap_or(false),
         };
 
         let timezone = env::var("BOT_TIMEZONE").unwrap_or_else(|_| "Asia/Seoul".to_string());
@@ -62,11 +69,38 @@ impl AppConfig {
             normal_priority_max: parse_usize_env("QUEUE_NORMAL_PRIORITY_MAX", 4_000),
         };
 
+        let processor = ProcessorConfig {
+            batch_max_messages: parse_usize_env("PROCESSOR_BATCH_MAX_MESSAGES", 30),
+            batch_max_chars: parse_usize_env("PROCESSOR_BATCH_MAX_CHARS", 48_000),
+            retry_attempts: parse_u32_env("PROCESSOR_RETRY_ATTEMPTS", 3).max(1),
+            max_requeues: parse_u32_env("PROCESSOR_MAX_REQUEUES", 5),
+            retry_base_delay: std::time::Duration::from_millis(parse_u64_env(
+                "PROCESSOR_RETRY_BASE_DELAY_MS",
+                500,
+            )),
+            web_fetch_concurrency: parse_usize_env("WEB_FETCH_CONCURRENCY", 4),
+        };
+
         let spam_cache = SpamCacheConfig {
             similarity_threshold: parse_f64_env("SPAM_CACHE_SIMILARITY_THRESHOLD", 0.92)
                 .clamp(0.0, 1.0),
             scan_limit: parse_i64_env("SPAM_CACHE_SCAN_LIMIT", 1_000).max(1),
             min_normalized_chars: parse_usize_env("SPAM_CACHE_MIN_NORMALIZED_CHARS", 8),
+            policy_version: env::var("SPAM_CACHE_POLICY_VERSION")
+                .unwrap_or_else(|_| "2026-07-v3".to_string()),
+            normalizer_version: parse_i64_env("SPAM_CACHE_NORMALIZER_VERSION", 3),
+            tentative_ttl: std::time::Duration::from_secs(parse_u64_env(
+                "SPAM_CACHE_TENTATIVE_TTL_SECS",
+                86_400,
+            )),
+            confirmed_ttl: std::time::Duration::from_secs(parse_u64_env(
+                "SPAM_CACHE_CONFIRMED_TTL_SECS",
+                7_776_000,
+            )),
+            prune_interval: std::time::Duration::from_secs(parse_u64_env(
+                "SPAM_CACHE_PRUNE_INTERVAL_SECS",
+                3_600,
+            )),
         };
 
         let web = WebContentConfig {
@@ -82,6 +116,7 @@ impl AppConfig {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(1_048_576),
             content_max_length: parse_usize_env("WEBPAGE_CONTENT_MAX_LENGTH", 1_000),
+            blocked_ips: parse_ip_list_env("WEBPAGE_BLOCKED_IPS")?,
         };
 
         let resilience = ResilienceConfig {
@@ -133,6 +168,7 @@ impl AppConfig {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
         };
+        validate_update_config(&update)?;
 
         Ok(Self {
             telegram_bot_token,
@@ -146,12 +182,35 @@ impl AppConfig {
             timezone,
             scheduler,
             queue,
+            processor,
             spam_cache,
             web,
             resilience,
             update,
         })
     }
+}
+
+fn required_non_empty(key: &'static str) -> Result<String, ConfigError> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or(ConfigError::Missing(key))
+}
+
+fn validate_update_config(update: &UpdateConfig) -> Result<(), ConfigError> {
+    if !update.enabled {
+        return Ok(());
+    }
+    let checksum = update
+        .asset_sha256
+        .as_deref()
+        .ok_or(ConfigError::Missing("AUTO_UPDATE_ASSET_SHA256"))?;
+    if checksum.len() != 64 || !checksum.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(ConfigError::Invalid("AUTO_UPDATE_ASSET_SHA256"));
+    }
+    Ok(())
 }
 
 fn parse_int(key: &str) -> Option<i64> {
@@ -184,6 +243,23 @@ fn parse_csv_env(key: &str, default: &[&str]) -> Vec<String> {
         .unwrap_or_else(|| default.iter().map(|value| value.to_string()).collect())
 }
 
+fn parse_ip_list_env(key: &'static str) -> Result<Vec<IpAddr>, ConfigError> {
+    env::var(key)
+        .ok()
+        .map(|value| parse_ip_list_value(key, &value))
+        .transpose()
+        .map(|value| value.unwrap_or_default())
+}
+
+fn parse_ip_list_value(key: &'static str, value: &str) -> Result<Vec<IpAddr>, ConfigError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse().map_err(|_| ConfigError::Invalid(key)))
+        .collect()
+}
+
 fn parse_usize_env(key: &str, default: usize) -> usize {
     env::var(key)
         .ok()
@@ -200,10 +276,66 @@ fn parse_i64_env(key: &str, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
+fn parse_u32_env(key: &str, default: u32) -> u32 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_u64_env(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 fn parse_f64_env(key: &str, default: f64) -> f64 {
     env::var(key)
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn update_config(enabled: bool, checksum: Option<&str>) -> UpdateConfig {
+        UpdateConfig {
+            enabled,
+            check_on_startup: true,
+            auto_restart: true,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            allowed_repo_owners: vec!["owner".to_string()],
+            allowed_repo_names: vec!["repo".to_string()],
+            allowed_asset_hosts: vec!["example.com".to_string()],
+            max_download_bytes: 1024,
+            asset_sha256: checksum.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn parses_blocked_ip_list() {
+        let values =
+            parse_ip_list_value("WEBPAGE_BLOCKED_IPS", "203.0.113.10, 2001:db8::10").unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], "203.0.113.10".parse::<IpAddr>().unwrap());
+        assert_eq!(values[1], "2001:db8::10".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn rejects_invalid_blocked_ip() {
+        assert!(parse_ip_list_value("WEBPAGE_BLOCKED_IPS", "not-an-ip").is_err());
+    }
+
+    #[test]
+    fn requires_detached_checksum_for_enabled_updates() {
+        assert!(validate_update_config(&update_config(true, None)).is_err());
+        assert!(validate_update_config(&update_config(true, Some("invalid"))).is_err());
+        assert!(validate_update_config(&update_config(true, Some(&"a".repeat(64)))).is_ok());
+        assert!(validate_update_config(&update_config(false, None)).is_ok());
+    }
 }
